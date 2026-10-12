@@ -1,0 +1,52 @@
+# Local agent state and recovered working notes
+.agents/
+.codex/
+history-chat.md
+tmp.md
+*.local.md
+
+# Secrets and local environment
+/local-scripts/
+.env
+.env.*
+!.env.example
+
+# Operating systems and editors
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
+*.swp
+
+# Go build and test output
+.cache/
+daemon/.cache/
+daemon/shotforwardd
+daemon/shotforwardd.exe
+*.test
+*.prof
+coverage.out
+
+# Frontend dependencies and build output
+node_modules/
+.next/
+dist/
+*.tsbuildinfo
+
+# Desktop packaging output and release-only sidecars
+desktop/src-tauri/target/
+desktop/src-tauri/gen/
+desktop/src-tauri/binaries/*
+!desktop/src-tauri/binaries/.gitkeep
+desktop/src-tauri/tauri.windows-signing.conf.json
+release-output/
+
+# Local UI and brand exploration; public screenshots live in docs/images
+design/
+
+# Local ShotForward runtime data
+*.db
+*.db-journal
+*.db-shm
+*.db-wal
+*.log

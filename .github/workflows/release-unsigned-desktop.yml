@@ -1,0 +1,87 @@
+name: Release unsigned desktop installers
+
+on:
+  push:
+    tags:
+      - "v*.*.*"
+
+permissions:
+  contents: write
+  id-token: write
+  attestations: write
+  artifact-metadata: write
+
+concurrency:
+  group: unsigned-desktop-release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  verify:
+    name: Verify source
+    uses: ./.github/workflows/ci.yml
+    with:
+      run_windows_checks: true
+
+  windows:
+    name: Build Windows installers
+    uses: ./.github/workflows/build-windows-desktop.yml
+    with:
+      release_tag: ${{ github.ref_name }}
+
+  macos:
+    name: Build macOS installers
+    uses: ./.github/workflows/build-macos-desktop.yml
+    with:
+      release_tag: ${{ github.ref_name }}
+
+  publish:
+    name: Publish GitHub Release
+    needs:
+      - verify
+      - windows
+      - macos
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Download unsigned installers
+        uses: actions/download-artifact@v7
+        with:
+          pattern: ShotForward-${{ github.ref_name }}-*-unsigned-installers
+          path: release-assets
+          merge-multiple: true
+
+      - name: Validate release assets
+        env:
+          RELEASE_TAG: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+          test -f "release-assets/ShotForward-$RELEASE_TAG-windows-x64-unsigned-setup.exe"
+          test -f "release-assets/ShotForward-$RELEASE_TAG-windows-x64-unsigned.msi"
+          test -f "release-assets/ShotForward-$RELEASE_TAG-windows-x64-unsigned-SHA256SUMS.txt"
+          test -f "release-assets/ShotForward-$RELEASE_TAG-macos-arm64-unsigned.dmg"
+          test -f "release-assets/ShotForward-$RELEASE_TAG-macos-arm64-unsigned-SHA256SUMS.txt"
+          test "$(find release-assets -maxdepth 1 -type f | wc -l)" -eq 5
+
+      - name: Publish unsigned installers
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          RELEASE_TAG: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+          printf '%s\n\n%s\n\n%s\n\n%s\n\n%s\n' \
+            'These are unsigned community builds of ShotForward.' \
+            'Your operating system may show an unknown-developer warning. Verify the accompanying SHA-256 file before installation.' \
+            'Third-party generation services may require separate accounts, API keys, subscriptions, or usage credits.' \
+            'Bundled FFmpeg/ffprobe binaries: https://github.com/shaka-project/static-ffmpeg-binaries/releases/tag/n8.1.2-1 — corresponding FFmpeg source: https://github.com/FFmpeg/FFmpeg/tree/n8.1.2' \
+            'Bundled Codex Runtime source and Apache-2.0 license: https://github.com/openai/codex/tree/rust-v0.154.0' \
+            > release-notes.md
+          if gh release view "$RELEASE_TAG" >/dev/null 2>&1; then
+            gh release upload "$RELEASE_TAG" release-assets/* --clobber
+          else
+            gh release create "$RELEASE_TAG" release-assets/* \
+              --verify-tag \
+              --title "ShotForward $RELEASE_TAG" \
+              --notes-file release-notes.md
+          fi

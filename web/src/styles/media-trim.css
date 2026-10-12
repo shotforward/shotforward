@@ -1,0 +1,123 @@
+.trimmed-media-player {
+  display: grid;
+  width: 100%;
+  min-width: 0;
+  gap: 10px;
+}
+
+.trimmed-media-player video {
+  display: block;
+  width: 100%;
+  max-height: 55vh;
+  object-fit: contain;
+}
+
+.trimmed-media-player__controls {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 8px 12px;
+  border-radius: 8px;
+  color: var(--color-text);
+  background: var(--color-surface-raised);
+}
+
+.trimmed-media-player__controls output {
+  white-space: nowrap;
+  font-size: 12px;
+  font-variant-numeric: tabular-nums;
+}
+
+.trimmed-media-player__controls input[type='range'] {
+  flex: 1;
+  min-width: 40px;
+}
+
+.media-trim-editor {
+  display: grid;
+  gap: 14px;
+  padding: 18px;
+  border: 1px solid var(--color-border);
+  border-radius: 12px;
+  background: var(--color-surface-muted);
+}
+
+.media-trim-editor > header {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  gap: 12px;
+}
+
+.media-trim-editor__fields {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 14px;
+}
+
+.media-trim-editor__timeline {
+  position: relative;
+  height: 32px;
+  margin-inline: 8px;
+}
+
+.media-trim-editor__track {
+  position: absolute;
+  inset: 14px 0;
+  height: 4px;
+  border-radius: 4px;
+  background: var(--color-border);
+}
+
+.media-trim-editor__track span {
+  position: absolute;
+  height: 100%;
+  border-radius: inherit;
+  background: var(--color-interactive);
+}
+
+.media-trim-editor__timeline input[type='range'] {
+  position: absolute;
+  inset: 0 -8px;
+  width: calc(100% + 16px);
+  height: 32px;
+  margin: 0;
+  padding: 0;
+  border: 0;
+  appearance: none;
+  pointer-events: none;
+  background: transparent;
+}
+
+.media-trim-editor__timeline input::-webkit-slider-thumb {
+  width: 16px;
+  height: 24px;
+  border: 1px solid var(--color-border);
+  border-radius: 5px;
+  appearance: none;
+  pointer-events: auto;
+  cursor: ew-resize;
+  background: var(--color-interactive);
+}
+
+.media-trim-editor__timeline input::-moz-range-thumb {
+  width: 16px;
+  height: 24px;
+  border: 1px solid var(--color-border);
+  border-radius: 5px;
+  pointer-events: auto;
+  cursor: ew-resize;
+  background: var(--color-interactive);
+}
+
+.media-trim-editor__timeline input:focus-visible {
+  outline: 2px solid var(--color-interactive);
+  outline-offset: 3px;
+}
+
+.media-trim-editor__duration {
+  margin: 0;
+  font-size: 12px;
+  font-variant-numeric: tabular-nums;
+  color: var(--color-text-secondary);
+}

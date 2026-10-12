@@ -1,0 +1,217 @@
+name: Build unsigned Windows desktop
+
+on:
+  workflow_call:
+    inputs:
+      release_tag:
+        description: Semantic version to embed, for example v0.2.0
+        required: true
+        type: string
+  workflow_dispatch:
+    inputs:
+      release_tag:
+        description: Semantic version to embed, for example v0.2.0
+        required: true
+        type: string
+
+permissions:
+  contents: read
+  id-token: write
+  attestations: write
+  artifact-metadata: write
+
+concurrency:
+  group: unsigned-windows-${{ github.ref }}-${{ inputs.release_tag }}
+  cancel-in-progress: false
+
+env:
+  TARGET: x86_64-pc-windows-msvc
+  FFMPEG_URL: https://github.com/shaka-project/static-ffmpeg-binaries/releases/download/n8.1.2-1/ffmpeg-win-x64.exe
+  FFMPEG_SHA256: 4044b3924c977ad31229d504c5d5b8685f9553124fbaff6e9c99048b42830341
+  FFPROBE_URL: https://github.com/shaka-project/static-ffmpeg-binaries/releases/download/n8.1.2-1/ffprobe-win-x64.exe
+  FFPROBE_SHA256: fc37ca23d31ee08bb8f7e108edf3822f6ef3efc1a8d306bbe0b779190230710b
+  CODEX_RUNTIME_URL: https://github.com/openai/codex/releases/download/rust-v0.154.0/codex-x86_64-pc-windows-msvc.exe
+  CODEX_RUNTIME_SHA256: be96b992178b1e467c225800da0d65f2c86d5eba1ef0b14632f65db381cbdfde
+
+jobs:
+  build:
+    name: Windows x64 unsigned installers
+    runs-on: windows-latest
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v7
+
+      - name: Validate release version
+        id: release
+        shell: pwsh
+        env:
+          REQUESTED_TAG: ${{ inputs.release_tag }}
+        run: |
+          if ($env:REQUESTED_TAG -match '^v([0-9]+\.[0-9]+\.[0-9]+)$') {
+            $version = $Matches[1]
+          } else {
+            throw "release_tag must be a stable semantic version such as v0.2.0"
+          }
+          "release_tag=$env:REQUESTED_TAG" | Out-File -FilePath $env:GITHUB_OUTPUT -Encoding utf8 -Append
+          "version=$version" | Out-File -FilePath $env:GITHUB_OUTPUT -Encoding utf8 -Append
+
+      - name: Set up Go
+        uses: actions/setup-go@v7
+        with:
+          go-version-file: daemon/go.mod
+          cache: false
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v7
+        with:
+          node-version: 22.21.1
+
+      - name: Set up Rust
+        uses: dtolnay/rust-toolchain@1.96.1
+        with:
+          targets: ${{ env.TARGET }}
+
+      - name: Restore Rust build cache
+        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          workspaces: desktop/src-tauri -> target
+          shared-key: desktop-${{ env.TARGET }}
+
+      - name: Install desktop dependencies
+        working-directory: desktop
+        run: npm ci
+
+      - name: Build embedded web application
+        working-directory: web
+        run: |
+          npm ci
+          npm run build
+
+      - name: Apply release version
+        shell: pwsh
+        env:
+          VERSION: ${{ steps.release.outputs.version }}
+        run: |
+          node -e "const fs=require('fs');const p='desktop/src-tauri/tauri.conf.json';const c=JSON.parse(fs.readFileSync(p,'utf8'));c.version=process.env.VERSION;fs.writeFileSync(p,JSON.stringify(c,null,2)+'\n')"
+
+      - name: Build Windows daemon
+        shell: pwsh
+        env:
+          GOOS: windows
+          GOARCH: amd64
+          CGO_ENABLED: "0"
+          VERSION: ${{ steps.release.outputs.version }}
+        run: |
+          $buildTime = (Get-Date).ToUniversalTime().ToString("yyyy-MM-ddTHH:mm:ssZ")
+          $output = "desktop/src-tauri/binaries/shotforwardd-$env:TARGET.exe"
+          Push-Location daemon
+          go build -trimpath -ldflags "-s -w -X main.version=$env:VERSION -X main.commit=$env:GITHUB_SHA -X main.buildTime=$buildTime" -o "../$output" ./cmd/shotforwardd
+          Pop-Location
+
+      - name: Download and verify pinned media tools
+        shell: pwsh
+        run: |
+          function Invoke-DownloadWithRetry {
+            param(
+              [Parameter(Mandatory)][string]$Uri,
+              [Parameter(Mandatory)][string]$OutFile,
+              [int]$MaxAttempts = 5
+            )
+            for ($attempt = 1; $attempt -le $MaxAttempts; $attempt++) {
+              try {
+                Remove-Item -Path $OutFile -Force -ErrorAction SilentlyContinue
+                Invoke-WebRequest -Uri $Uri -OutFile $OutFile -ErrorAction Stop
+                return
+              } catch {
+                if ($attempt -eq $MaxAttempts) { throw }
+                $delaySeconds = [Math]::Pow(2, $attempt)
+                Write-Warning "Download attempt $attempt/$MaxAttempts failed for $Uri. Retrying in $delaySeconds seconds: $($_.Exception.Message)"
+                Start-Sleep -Seconds $delaySeconds
+              }
+            }
+          }
+
+          $directory = "desktop/src-tauri/binaries"
+          $ffmpeg = "$directory/ffmpeg-$env:TARGET.exe"
+          $ffprobe = "$directory/ffprobe-$env:TARGET.exe"
+          Invoke-DownloadWithRetry -Uri $env:FFMPEG_URL -OutFile $ffmpeg
+          Invoke-DownloadWithRetry -Uri $env:FFPROBE_URL -OutFile $ffprobe
+          if ((Get-FileHash $ffmpeg -Algorithm SHA256).Hash -ne $env:FFMPEG_SHA256.ToUpperInvariant()) { throw "ffmpeg SHA-256 mismatch" }
+          if ((Get-FileHash $ffprobe -Algorithm SHA256).Hash -ne $env:FFPROBE_SHA256.ToUpperInvariant()) { throw "ffprobe SHA-256 mismatch" }
+          & $ffmpeg -version
+          if ($LASTEXITCODE -ne 0) { throw "ffmpeg self-check failed" }
+          & $ffprobe -version
+          if ($LASTEXITCODE -ne 0) { throw "ffprobe self-check failed" }
+
+      - name: Download and verify pinned Codex runtime
+        shell: pwsh
+        run: |
+          function Invoke-DownloadWithRetry {
+            param(
+              [Parameter(Mandatory)][string]$Uri,
+              [Parameter(Mandatory)][string]$OutFile,
+              [int]$MaxAttempts = 5
+            )
+            for ($attempt = 1; $attempt -le $MaxAttempts; $attempt++) {
+              try {
+                Remove-Item -Path $OutFile -Force -ErrorAction SilentlyContinue
+                Invoke-WebRequest -Uri $Uri -OutFile $OutFile -ErrorAction Stop
+                return
+              } catch {
+                if ($attempt -eq $MaxAttempts) { throw }
+                $delaySeconds = [Math]::Pow(2, $attempt)
+                Write-Warning "Download attempt $attempt/$MaxAttempts failed for $Uri. Retrying in $delaySeconds seconds: $($_.Exception.Message)"
+                Start-Sleep -Seconds $delaySeconds
+              }
+            }
+          }
+
+          $output = "desktop/src-tauri/binaries/shotforward-codex-runtime-$env:TARGET.exe"
+          Invoke-DownloadWithRetry -Uri $env:CODEX_RUNTIME_URL -OutFile $output
+          if ((Get-FileHash $output -Algorithm SHA256).Hash -ne $env:CODEX_RUNTIME_SHA256.ToUpperInvariant()) { throw "Codex runtime SHA-256 mismatch" }
+          & $output --version
+          if ($LASTEXITCODE -ne 0) { throw "Codex runtime self-check failed" }
+
+      - name: Build unsigned Windows installers
+        working-directory: desktop
+        run: npm run tauri -- build --ci --target $env:TARGET --bundles nsis,msi --no-sign
+
+      - name: Collect unsigned Windows installers
+        id: installers
+        shell: pwsh
+        env:
+          RELEASE_TAG: ${{ steps.release.outputs.release_tag }}
+        run: |
+          $bundleRoot = "desktop/src-tauri/target/$env:TARGET/release/bundle"
+          $nsis = @(Get-ChildItem "$bundleRoot/nsis/*.exe" -File)
+          $msi = @(Get-ChildItem "$bundleRoot/msi/*.msi" -File)
+          if ($nsis.Count -ne 1) { throw "expected exactly one NSIS installer, found $($nsis.Count)" }
+          if ($msi.Count -ne 1) { throw "expected exactly one MSI installer, found $($msi.Count)" }
+
+          $name = "ShotForward-$env:RELEASE_TAG-windows-x64-unsigned-installers"
+          $directory = Join-Path $env:RUNNER_TEMP $name
+          New-Item -ItemType Directory -Force -Path $directory | Out-Null
+          Copy-Item $nsis[0].FullName (Join-Path $directory "ShotForward-$env:RELEASE_TAG-windows-x64-unsigned-setup.exe")
+          Copy-Item $msi[0].FullName (Join-Path $directory "ShotForward-$env:RELEASE_TAG-windows-x64-unsigned.msi")
+
+          $checksums = Get-ChildItem $directory -File | Sort-Object Name | ForEach-Object {
+            "$((Get-FileHash $_.FullName -Algorithm SHA256).Hash.ToLowerInvariant())  $($_.Name)"
+          }
+          $checksums | Set-Content -Encoding ascii (Join-Path $directory "ShotForward-$env:RELEASE_TAG-windows-x64-unsigned-SHA256SUMS.txt")
+          "directory=$directory" | Out-File -FilePath $env:GITHUB_OUTPUT -Encoding utf8 -Append
+          "name=$name" | Out-File -FilePath $env:GITHUB_OUTPUT -Encoding utf8 -Append
+
+      - name: Attest unsigned Windows installers
+        if: github.event.repository.visibility == 'public'
+        uses: actions/attest@v4
+        with:
+          subject-path: ${{ steps.installers.outputs.directory }}/*
+
+      - name: Upload unsigned Windows installers
+        uses: actions/upload-artifact@v7
+        with:
+          name: ${{ steps.installers.outputs.name }}
+          path: ${{ steps.installers.outputs.directory }}/*
+          if-no-files-found: error
+          compression-level: 0
+          retention-days: 7

@@ -1,0 +1,129 @@
+:root {
+  /* ShotForward brand primitives. Keep these aligned with the approved navy/sage logo. */
+  --sf-brand-navy: #213650;
+  --sf-brand-navy-deep: #17334d;
+  --sf-brand-navy-dark: #0f293f;
+  --sf-brand-sage: #718f6a;
+  --sf-brand-green: #4f704f;
+
+  /* Neutral and semantic color roles. Components should consume these aliases. */
+  --color-canvas: #f3f4f2;
+  --color-surface: #fbfcfa;
+  --color-surface-raised: #ffffff;
+  --color-surface-subtle: #f7f8f6;
+  --color-surface-muted: #edf0ee;
+  --color-text: #172534;
+  --color-text-secondary: #344555;
+  --color-text-muted: #687581;
+  --color-text-faint: #8b959d;
+  --color-border: #dce1de;
+  --color-border-strong: #c6ceca;
+  --color-interactive: var(--sf-brand-navy-deep);
+  --color-interactive-hover: var(--sf-brand-navy-dark);
+  --color-interactive-soft: #e7ede4;
+  --color-accent: var(--sf-brand-green);
+  --color-accent-soft: #edf1eb;
+  --color-focus-ring: rgb(23 51 77 / 18%);
+  --color-success: #356948;
+  --color-success-soft: #edf5ef;
+  --color-warning: #a16b19;
+  --color-warning-soft: #fcf6e9;
+  --color-danger: #9a443e;
+  --color-danger-hover: #80362f;
+  --color-danger-soft: #fcf5f4;
+  --color-stage: #101820;
+  --color-stage-raised: #172534;
+  --color-stage-text: #f4f6f5;
+
+  /* Geometry, elevation, and density. */
+  --space-1: 4px;
+  --space-2: 8px;
+  --space-3: 12px;
+  --space-4: 16px;
+  --space-5: 24px;
+  --space-6: 32px;
+  --control-height-sm: 36px;
+  --control-height: 40px;
+  --radius-control: 7px;
+  --radius-panel: 10px;
+  --radius-dialog: 10px;
+  --shadow-card: 0 1px 2px rgb(23 37 52 / 4%), 0 8px 24px rgb(23 37 52 / 5%);
+  --shadow-raised: 0 12px 34px rgb(23 37 52 / 10%);
+  --shadow-popover: 0 18px 44px rgb(23 37 52 / 14%), 0 3px 10px rgb(23 37 52 / 7%);
+  --duration-fast: 140ms;
+  --duration-standard: 180ms;
+  --ease-standard: cubic-bezier(0.2, 0, 0, 1);
+
+  /* Compatibility aliases while route styles migrate to semantic roles. */
+  --blue: var(--color-interactive);
+  --blue-hover: var(--color-interactive-hover);
+  --blue-soft: var(--color-accent-soft);
+  --ink: var(--color-text);
+  --muted: var(--color-text-muted);
+  --line: var(--color-border);
+  --line-soft: var(--color-surface-muted);
+  --surface: var(--color-surface-raised);
+  --canvas: var(--color-canvas);
+  --danger: var(--color-danger);
+  --radius-sm: var(--radius-control);
+  --radius-md: var(--radius-panel);
+  --shadow-float: var(--shadow-raised);
+  --select-border: var(--color-border-strong);
+  --select-border-hover: #9ca8a2;
+  --select-focus: var(--color-interactive);
+  --select-option-hover: var(--color-surface-muted);
+  --select-option-selected: var(--color-accent-soft);
+  --select-shadow: var(--shadow-popover);
+}
+
+:root[data-theme='mist'] {
+  --color-canvas: #eff3f5;
+  --color-surface: #f9fbfc;
+  --color-surface-raised: #ffffff;
+  --color-surface-subtle: #f4f7f8;
+  --color-surface-muted: #e7edef;
+  --color-text: #182a3a;
+  --color-text-secondary: #3b5061;
+  --color-text-muted: #697b87;
+  --color-text-faint: #8a98a1;
+  --color-border: #d6e0e4;
+  --color-border-strong: #bdccd2;
+  --color-interactive: #315f7a;
+  --color-interactive-hover: #234a63;
+  --color-interactive-soft: #e1ecf2;
+  --color-accent: #66879a;
+  --color-accent-soft: #e5eef3;
+  --color-focus-ring: rgb(49 95 122 / 18%);
+  --select-border-hover: #90a7b2;
+}
+
+:root[data-theme='sand'] {
+  --color-canvas: #f3f0e9;
+  --color-surface: #fcfaf5;
+  --color-surface-raised: #fffefd;
+  --color-surface-subtle: #f7f4ee;
+  --color-surface-muted: #ebe7dc;
+  --color-text: #292821;
+  --color-text-secondary: #4c4a40;
+  --color-text-muted: #777268;
+  --color-text-faint: #938d82;
+  --color-border: #ded9cd;
+  --color-border-strong: #c8c0af;
+  --color-interactive: #574b3e;
+  --color-interactive-hover: #44392f;
+  --color-interactive-soft: #eee8df;
+  --color-accent: #7a7358;
+  --color-accent-soft: #efede3;
+  --color-focus-ring: rgb(87 75 62 / 18%);
+  --select-border-hover: #a9a08e;
+}
+
+[data-surface='stage'] {
+  --color-surface: var(--color-stage);
+  --color-surface-raised: var(--color-stage-raised);
+  --color-text: var(--color-stage-text);
+  --color-text-secondary: #c2cbc7;
+  --color-text-muted: #939f9a;
+  --color-border: rgb(255 255 255 / 12%);
+  color-scheme: dark;
+}

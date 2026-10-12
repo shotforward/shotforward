@@ -1,0 +1,23 @@
+ShotForward Desktop — Third-Party Notices
+
+This distribution bundles FFmpeg and ffprobe. FFmpeg is a trademark of
+Fabrice Bellard, originator of the FFmpeg project. The FFmpeg project is not
+affiliated with ShotForward.
+
+Depending on its build configuration, FFmpeg is distributed under the GNU
+Lesser General Public License (LGPL) version 2.1 or later or the GNU General
+Public License (GPL) version 2 or later. The exact license and corresponding
+source offer for the binaries in a ShotForward release must be published with
+that release and are determined by the audited binary source configured in the
+release workflow.
+
+FFmpeg project and source code: https://ffmpeg.org/
+
+Codex CLI
+Copyright OpenAI
+Licensed under the Apache License, Version 2.0.
+Source code: https://github.com/openai/codex
+
+Additional third-party components retain their respective copyright notices
+and license terms. See the application distribution and project repository for
+the notices corresponding to a specific release.

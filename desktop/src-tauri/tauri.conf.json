@@ -1,0 +1,71 @@
+{
+  "$schema": "https://schema.tauri.app/config/2",
+  "productName": "ShotForward",
+  "version": "0.2.63",
+  "identifier": "com.shotforward.studio",
+  "build": {
+    "frontendDist": "../shell"
+  },
+  "app": {
+    "windows": [],
+    "security": {
+      "capabilities": [
+        {
+          "identifier": "main-loopback-ui",
+          "description": "Allow the trusted ShotForward loopback UI to choose project folders and script files, open validated web links, and save validated local files.",
+          "windows": ["main"],
+          "remote": {
+            "urls": ["http://127.0.0.1:*/*", "http://[\\:\\:1]:*/*"]
+          },
+          "permissions": [
+            "allow-select-project-parent",
+            "allow-select-script-file",
+            "allow-open-external",
+            "allow-save-download",
+            "allow-save-text-file"
+          ]
+        }
+      ],
+      "csp": null
+    }
+  },
+  "bundle": {
+    "active": true,
+    "targets": "all",
+    "category": "Video",
+    "copyright": "Copyright © 2026 ShotForward",
+    "shortDescription": "Local-first AI video production workspace",
+    "longDescription": "Create scripts, reusable assets, storyboards, generated media, previews, and production exports in one local-first workspace.",
+    "licenseFile": "../../LICENSE",
+    "externalBin": [
+      "binaries/shotforwardd",
+      "binaries/shotforward-codex-runtime",
+      "binaries/ffmpeg",
+      "binaries/ffprobe"
+    ],
+    "resources": ["resources/THIRD_PARTY_NOTICES.txt"],
+    "icon": [
+      "icons/32x32.png",
+      "icons/128x128.png",
+      "icons/128x128@2x.png",
+      "icons/icon.png",
+      "icons/icon.ico"
+    ],
+    "macOS": {
+      "minimumSystemVersion": "12.0",
+      "hardenedRuntime": true
+    },
+    "windows": {
+      "digestAlgorithm": "sha256",
+      "timestampUrl": "http://timestamp.digicert.com",
+      "webviewInstallMode": {
+        "type": "downloadBootstrapper",
+        "silent": true
+      },
+      "nsis": {
+        "installMode": "currentUser",
+        "languages": ["English", "SimpChinese"]
+      }
+    }
+  }
+}

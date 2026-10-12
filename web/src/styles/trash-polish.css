@@ -1,0 +1,149 @@
+.trash-content {
+  width: min(1480px, 100%);
+  margin-inline: auto;
+}
+
+.trash-content-heading h1 {
+  color: var(--color-text);
+  letter-spacing: -0.025em;
+}
+
+.trash-content-heading p,
+.trash-content-heading > span,
+.project-tool-back-link {
+  color: var(--color-text-muted);
+}
+
+.project-tool-back-link:hover {
+  color: var(--color-interactive);
+}
+
+.trash-toolbar label {
+  border-color: var(--color-border);
+  border-radius: var(--radius-control);
+  color: var(--color-text-muted);
+  background: var(--color-surface-raised);
+}
+
+.trash-toolbar label:focus-within {
+  border-color: var(--color-interactive);
+  box-shadow: 0 0 0 3px var(--color-focus-ring);
+}
+
+.trash-toolbar input {
+  color: var(--color-text);
+  background: transparent;
+}
+
+.trash-filters button {
+  border-radius: var(--radius-control);
+  color: var(--color-text-muted);
+}
+
+.trash-filters button:hover {
+  color: var(--color-text);
+  background: var(--color-surface-muted);
+}
+
+.trash-filters button.active {
+  color: var(--color-interactive);
+  background: var(--color-interactive-soft);
+}
+
+.trash-list {
+  border-color: var(--color-border);
+  border-radius: var(--radius-panel) 0 0 var(--radius-panel);
+  background: var(--color-surface-raised);
+  box-shadow: var(--shadow-card);
+}
+
+.trash-columns {
+  color: var(--color-text-faint);
+  background: var(--color-surface-subtle);
+}
+
+.trash-list > button {
+  color: var(--color-text-secondary);
+  background: var(--color-surface-raised);
+  transition: background var(--duration-fast) var(--ease-standard);
+}
+
+.trash-list > button:hover {
+  background: var(--color-surface-subtle);
+}
+
+.trash-list > button.active {
+  background: var(--color-interactive-soft);
+  box-shadow: inset 3px 0 var(--color-interactive);
+}
+
+.trash-object-icon {
+  color: var(--color-interactive);
+  background: var(--color-surface-muted);
+}
+
+.trash-list > button small,
+.trash-list > button > span:nth-child(3),
+.trash-list time,
+.restore-panel > header span,
+.restore-panel section > p,
+.restore-panel li,
+.restore-panel--empty {
+  color: var(--color-text-muted);
+}
+
+.restore-panel {
+  border-color: var(--color-border);
+  border-radius: 0 var(--radius-panel) var(--radius-panel) 0;
+  background: var(--color-surface-subtle);
+  box-shadow: var(--shadow-card);
+}
+
+.restore-panel h2,
+.restore-panel h3,
+.trash-empty h2 {
+  color: var(--color-text);
+}
+
+.check-row span {
+  color: var(--color-success);
+}
+
+.restore-panel > .button {
+  border-color: var(--color-interactive);
+  color: var(--color-stage-text);
+  background: var(--color-interactive);
+}
+
+@media (max-width: 900px) {
+  .trash-layout {
+    display: block;
+  }
+
+  .trash-list,
+  .restore-panel {
+    border-radius: var(--radius-panel);
+  }
+
+  .restore-panel {
+    margin-block-start: 14px;
+    border-inline-start: 1px solid var(--color-border);
+  }
+}
+
+@media (max-width: 700px) {
+  .trash-toolbar,
+  .trash-content-heading {
+    align-items: stretch;
+    flex-direction: column;
+  }
+
+  .trash-toolbar label,
+  .trash-toolbar > .select-control {
+    width: 100%;
+  }
+
+  .trash-filters {
+    overflow-x: auto;
+  }
+}

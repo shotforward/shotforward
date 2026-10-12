@@ -1,0 +1,111 @@
+name: CI
+
+on:
+  workflow_call:
+    inputs:
+      run_windows_checks:
+        description: Run the Windows daemon and desktop test job
+        required: false
+        type: boolean
+        default: true
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  checks:
+    name: Web and daemon checks
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v7
+
+      - name: Set up Go
+        uses: actions/setup-go@v7
+        with:
+          go-version-file: daemon/go.mod
+          cache: ${{ !startsWith(github.ref, 'refs/tags/') }}
+          cache-dependency-path: daemon/go.sum
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v7
+        with:
+          node-version: 22.21.1
+          cache: ${{ !startsWith(github.ref, 'refs/tags/') && 'npm' || '' }}
+          cache-dependency-path: web/package-lock.json
+
+      - name: Test and build web application
+        working-directory: web
+        run: |
+          npm ci
+          npm test
+          npm run build
+
+      - name: Test daemon
+        working-directory: daemon
+        run: go test ./...
+
+  windows-checks:
+    name: Windows daemon and desktop checks
+    # Reusable workflows retain the caller's event name (for releases: push).
+    if: github.event_name == 'pull_request' || inputs.run_windows_checks
+    runs-on: windows-latest
+    env:
+      TARGET: x86_64-pc-windows-msvc
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v7
+
+      - name: Set up Go
+        uses: actions/setup-go@v7
+        with:
+          go-version-file: daemon/go.mod
+          cache: ${{ !startsWith(github.ref, 'refs/tags/') }}
+          cache-dependency-path: daemon/go.sum
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v7
+        with:
+          node-version: 22.21.1
+          cache: ${{ !startsWith(github.ref, 'refs/tags/') && 'npm' || '' }}
+          cache-dependency-path: web/package-lock.json
+
+      - name: Set up Rust
+        uses: dtolnay/rust-toolchain@1.96.1
+        with:
+          targets: ${{ env.TARGET }}
+
+      - name: Restore Rust build cache
+        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          workspaces: desktop/src-tauri -> target
+          shared-key: desktop-${{ env.TARGET }}
+
+      - name: Build embedded web application
+        working-directory: web
+        run: |
+          npm ci
+          npm run build
+
+      - name: Test daemon
+        working-directory: daemon
+        run: go test ./...
+
+      - name: Create test sidecar placeholders
+        shell: pwsh
+        run: |
+          $directory = "desktop/src-tauri/binaries"
+          New-Item -ItemType Directory -Force -Path $directory | Out-Null
+          @("shotforwardd", "shotforward-codex-runtime", "ffmpeg", "ffprobe") | ForEach-Object {
+            $path = Join-Path $directory "$($_)-$env:TARGET.exe"
+            New-Item -ItemType File -Force -Path $path | Out-Null
+          }
+
+      - name: Test desktop shell
+        working-directory: desktop/src-tauri
+        run: cargo test --locked --target $env:TARGET

@@ -1,0 +1,178 @@
+name: Build unsigned macOS desktop
+
+on:
+  workflow_call:
+    inputs:
+      release_tag:
+        description: Semantic version to embed, for example v0.2.0
+        required: true
+        type: string
+  workflow_dispatch:
+    inputs:
+      release_tag:
+        description: Semantic version to embed, for example v0.2.0
+        required: true
+        type: string
+
+permissions:
+  contents: read
+  id-token: write
+  attestations: write
+  artifact-metadata: write
+
+concurrency:
+  group: unsigned-macos-${{ github.ref }}-${{ inputs.release_tag }}
+  cancel-in-progress: false
+
+jobs:
+  build:
+    name: ${{ matrix.label }} unsigned installer
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - label: macOS Apple Silicon
+            runner: macos-latest
+            target: aarch64-apple-darwin
+            goarch: arm64
+            artifact_arch: arm64
+            ffmpeg_url: https://github.com/shaka-project/static-ffmpeg-binaries/releases/download/n8.1.2-1/ffmpeg-osx-arm64
+            ffmpeg_sha256: e7b9fcd97f95f333512d6e8b8ac24d9dbc08f189f36047695499bd7b57214b22
+            ffprobe_url: https://github.com/shaka-project/static-ffmpeg-binaries/releases/download/n8.1.2-1/ffprobe-osx-arm64
+            ffprobe_sha256: ded4c698b8ff38d0bc1fd30fcc5e768dc46f58bc15a8dfd61f98615ba49cde5c
+            codex_url: https://github.com/openai/codex/releases/download/rust-v0.154.0/codex-aarch64-apple-darwin.tar.gz
+            codex_sha256: 344310a0a591c1b192e04feff304321a69907c9498baaac331ca7e16ebcef9d7
+    runs-on: ${{ matrix.runner }}
+    env:
+      TARGET: ${{ matrix.target }}
+      MACOSX_DEPLOYMENT_TARGET: "12.0"
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v7
+
+      - name: Validate release version
+        id: release
+        shell: bash
+        env:
+          REQUESTED_TAG: ${{ inputs.release_tag }}
+        run: |
+          if [[ ! "$REQUESTED_TAG" =~ ^v([0-9]+\.[0-9]+\.[0-9]+)$ ]]; then
+            echo "release_tag must be a stable semantic version such as v0.2.0" >&2
+            exit 1
+          fi
+          echo "release_tag=$REQUESTED_TAG" >> "$GITHUB_OUTPUT"
+          echo "version=${BASH_REMATCH[1]}" >> "$GITHUB_OUTPUT"
+
+      - name: Set up Go
+        uses: actions/setup-go@v7
+        with:
+          go-version-file: daemon/go.mod
+          cache: false
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v7
+        with:
+          node-version: 22.21.1
+
+      - name: Set up Rust
+        uses: dtolnay/rust-toolchain@1.96.1
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: Restore Rust build cache
+        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          workspaces: desktop/src-tauri -> target
+          shared-key: desktop-${{ matrix.target }}
+
+      - name: Install desktop dependencies
+        working-directory: desktop
+        run: npm ci
+
+      - name: Build embedded web application
+        working-directory: web
+        run: |
+          npm ci
+          npm run build
+
+      - name: Apply release version
+        env:
+          VERSION: ${{ steps.release.outputs.version }}
+        run: node -e "const fs=require('fs');const p='desktop/src-tauri/tauri.conf.json';const c=JSON.parse(fs.readFileSync(p,'utf8'));c.version=process.env.VERSION;fs.writeFileSync(p,JSON.stringify(c,null,2)+'\n')"
+
+      - name: Build macOS daemon
+        env:
+          GOOS: darwin
+          GOARCH: ${{ matrix.goarch }}
+          CGO_ENABLED: "0"
+          VERSION: ${{ steps.release.outputs.version }}
+        run: |
+          build_time="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+          output="desktop/src-tauri/binaries/shotforwardd-$TARGET"
+          cd daemon
+          go build -trimpath -ldflags "-s -w -X main.version=$VERSION -X main.commit=$GITHUB_SHA -X main.buildTime=$build_time" -o "../$output" ./cmd/shotforwardd
+
+      - name: Download and verify pinned media tools
+        env:
+          FFMPEG_URL: ${{ matrix.ffmpeg_url }}
+          FFMPEG_SHA256: ${{ matrix.ffmpeg_sha256 }}
+          FFPROBE_URL: ${{ matrix.ffprobe_url }}
+          FFPROBE_SHA256: ${{ matrix.ffprobe_sha256 }}
+        run: ./desktop/scripts/download-media-tools.sh "$TARGET"
+
+      - name: Download and verify pinned Codex runtime
+        env:
+          CODEX_RUNTIME_URL: ${{ matrix.codex_url }}
+          CODEX_RUNTIME_SHA256: ${{ matrix.codex_sha256 }}
+          TAURI_ENV_TARGET_TRIPLE: ${{ matrix.target }}
+        run: ./desktop/scripts/download-codex-runtime.sh
+
+      - name: Verify downloaded binary architectures
+        run: |
+          file desktop/src-tauri/binaries/*-"$TARGET"
+          desktop/src-tauri/binaries/ffmpeg-"$TARGET" -version
+          desktop/src-tauri/binaries/ffprobe-"$TARGET" -version
+
+      - name: Build unsigned macOS installer
+        working-directory: desktop
+        run: npm run tauri -- build --ci --target "$TARGET" --bundles dmg --no-sign
+
+      - name: Collect unsigned macOS installer
+        id: installer
+        env:
+          RELEASE_TAG: ${{ steps.release.outputs.release_tag }}
+          ARTIFACT_ARCH: ${{ matrix.artifact_arch }}
+        run: |
+          shopt -s nullglob
+          installers=(desktop/src-tauri/target/"$TARGET"/release/bundle/dmg/*.dmg)
+          if [[ ${#installers[@]} -ne 1 ]]; then
+            echo "expected exactly one DMG installer, found ${#installers[@]}" >&2
+            exit 1
+          fi
+
+          name="ShotForward-$RELEASE_TAG-macos-$ARTIFACT_ARCH-unsigned-installers"
+          directory="$RUNNER_TEMP/$name"
+          installer_name="ShotForward-$RELEASE_TAG-macos-$ARTIFACT_ARCH-unsigned.dmg"
+          mkdir -p "$directory"
+          cp "${installers[0]}" "$directory/$installer_name"
+          (
+            cd "$directory"
+            shasum -a 256 "$installer_name" > "ShotForward-$RELEASE_TAG-macos-$ARTIFACT_ARCH-unsigned-SHA256SUMS.txt"
+          )
+          echo "directory=$directory" >> "$GITHUB_OUTPUT"
+          echo "name=$name" >> "$GITHUB_OUTPUT"
+
+      - name: Attest unsigned macOS installer
+        if: github.event.repository.visibility == 'public'
+        uses: actions/attest@v4
+        with:
+          subject-path: ${{ steps.installer.outputs.directory }}/*
+
+      - name: Upload unsigned macOS installer
+        uses: actions/upload-artifact@v7
+        with:
+          name: ${{ steps.installer.outputs.name }}
+          path: ${{ steps.installer.outputs.directory }}/*
+          if-no-files-found: error
+          compression-level: 0
+          retention-days: 7
