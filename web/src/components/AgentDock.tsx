@@ -1,5 +1,6 @@
 import {
   ChangeEvent,
+  ClipboardEvent,
   FormEvent,
   KeyboardEvent,
   PointerEvent,
@@ -12,6 +13,7 @@ import { useInfiniteQuery, useMutation, useQuery, useQueryClient } from '@tansta
 import { Link } from 'react-router';
 import { useTranslation } from 'react-i18next';
 import {
+  compactSessionContext,
   getSessionMessages,
   getSessionSnapshot,
   interruptAgentTurn,
@@ -66,6 +68,13 @@ import {
 import { AgentMarkdown } from './AgentMarkdown';
 import { Select } from './Select';
 import { Dialog } from './Dialog';
+import { formatAgentElapsed, useAgentTurnElapsed } from './AgentDockProgress';
+import {
+  agentMediaErrorMessageKey,
+  clipboardImageFiles,
+  maximumAgentAttachments,
+  prepareAgentImageFiles,
+} from './AgentDockMedia';
 import '../styles/agent-dock.css';
 
 const liveSnapshotPollIntervalMilliseconds = 1_000;
@@ -89,12 +98,19 @@ interface AgentSubmission {
   focus: AgentFocus;
   attachments: AgentConversationMedia[];
   clientOperationID: string;
+  attachmentWorkKey: string;
   videoPromptTarget?: AgentVideoPromptTarget;
   isCurrentUI: () => boolean;
 }
 
 interface MediaAction {
   media: AgentConversationMedia;
+}
+
+interface AttachmentWork {
+  key: string;
+  reserved: number;
+  queue: Promise<void>;
 }
 
 interface ResizeGesture {
@@ -188,11 +204,20 @@ export function AgentDock({
       selectableSessions.find((session) => session.status === 'active') ??
       selectableSessions[0]);
   const sessionID = selectedSession?.id;
+  const compactionView = useRef({ scope, sessionID });
+  if (compactionView.current.scope !== scope || compactionView.current.sessionID !== sessionID) {
+    compactionView.current = { scope, sessionID };
+  }
+  const compactionRequests = useRef(new Set<string>());
+  const [pendingCompactions, setPendingCompactions] = useState(new Set<string>());
+  const compactionKey = `${scope}/${sessionID ?? ''}`;
   const snapshot = useQuery({
     queryKey: ['agent-session', sessionID],
     queryFn: () => getSessionSnapshot(sessionID!),
     enabled: Boolean(sessionID),
     refetchInterval: (query) =>
+      pendingCompactions.has(compactionKey) ||
+      (query.state.data as SessionSnapshot | undefined)?.context_compacting ||
       (query.state.data as SessionSnapshot | undefined)?.turns.some((turn) => isLiveTurnStatus(turn.status))
         ? liveSnapshotPollIntervalMilliseconds
         : false,
@@ -208,7 +233,27 @@ export function AgentDock({
     retry: (failureCount, error) => isConversationHistoryInitializing(error) && failureCount < 4,
     retryDelay: (failureCount) => Math.min(250 * 2 ** failureCount, 2_000),
   });
-  const stream = useAgentEvents(canSend ? sessionID : undefined, snapshot.data?.cursor);
+  const latestSnapshotTurn = [...(snapshot.data?.turns ?? [])].sort(compareTurns).at(-1);
+  const conversationTurns = useMemo(
+    () =>
+      chronologicalTurns(conversation.data?.pages ?? []).map((item) => {
+        const authoritative = snapshot.data?.turns.find((turn) => turn.id === item.turn.id);
+        return authoritative ? { ...item, turn: authoritative } : item;
+      }),
+    [conversation.data, snapshot.data?.turns],
+  );
+  const liveTurn = snapshot.data
+    ? [...snapshot.data.turns]
+        .sort(compareTurns)
+        .reverse()
+        .find((turn) => isLiveTurnStatus(turn.status))
+    : [...conversationTurns].reverse().find(({ turn }) => isLiveTurnStatus(turn.status))?.turn;
+  const stream = useAgentEvents(
+    canSend ? sessionID : undefined,
+    snapshot.data?.cursor,
+    liveTurn ?? (snapshot.data ? null : undefined),
+  );
+  const elapsedSeconds = useAgentTurnElapsed(sessionID, liveTurn);
   const [input, setInput] = useState('');
   const [clientOperationID, setClientOperationID] = useState(createOperationKey);
   const receivingContext = useRef({ scope, sessionID, clientOperationID });
@@ -236,10 +281,34 @@ export function AgentDock({
     };
   }
   const [attachments, setAttachments] = useState<AgentConversationMedia[]>([]);
-  const [uploadingMedia, setUploadingMedia] = useState(false);
+  const attachmentsRef = useRef(attachments);
+  attachmentsRef.current = attachments;
+  const attachmentWorkKey = `${scope}/${sessionID ?? ''}/${clientOperationID}`;
+  const attachmentWork = useRef<AttachmentWork>({
+    key: attachmentWorkKey,
+    reserved: 0,
+    queue: Promise.resolve(),
+  });
+  if (attachmentWork.current.key !== attachmentWorkKey) {
+    attachmentWork.current = { key: attachmentWorkKey, reserved: 0, queue: Promise.resolve() };
+  }
+  const [pendingMedia, setPendingMedia] = useState({ key: attachmentWorkKey, count: 0 });
+  const pendingMediaCount = pendingMedia.key === attachmentWorkKey ? pendingMedia.count : 0;
+  const submittingAttachmentsFor = useRef<string | undefined>(undefined);
+  function setPendingMediaCount(count: number) {
+    setPendingMedia({ key: attachmentWork.current.key, count });
+  }
+  const uploadingMedia = pendingMediaCount > 0;
   const [mediaError, setMediaError] = useState('');
   const [assetPickerOpen, setAssetPickerOpen] = useState(false);
   const [mediaAction, setMediaAction] = useState<MediaAction>();
+  function updateAttachments(
+    next: AgentConversationMedia[] | ((current: AgentConversationMedia[]) => AgentConversationMedia[]),
+  ) {
+    const value = typeof next === 'function' ? next(attachmentsRef.current) : next;
+    attachmentsRef.current = value;
+    setAttachments(value);
+  }
   const [optimisticInput, setOptimisticInput] = useState<OptimisticInput>();
   const submittedContexts = useRef(
     new Map<
@@ -252,7 +321,6 @@ export function AgentDock({
     >(),
   );
   const [model, setModel] = useState('');
-  const latestSnapshotTurn = [...(snapshot.data?.turns ?? [])].sort(compareTurns).at(-1);
   const latestTurnModel = latestSnapshotTurn?.model_id;
   const preferredModel = preferredAgentModelForRuntime(activeRuntimeKind);
   const availableModels = (runtime.data?.models ?? []).map(normalizeRuntimeModel);
@@ -295,6 +363,7 @@ export function AgentDock({
     ? agentSessionFailureCopy.zh
     : agentSessionFailureCopy.en;
   const conversationMediaCopy = i18n.resolvedLanguage?.startsWith('zh') ? mediaCopy.zh : mediaCopy.en;
+  const progressCopy = i18n.resolvedLanguage?.startsWith('zh') ? agentProgressCopy.zh : agentProgressCopy.en;
   const assets = useQuery({
     queryKey: ['assets', projectID, episodeID],
     queryFn: () => listEpisodeAssets(projectID, episodeID),
@@ -380,7 +449,7 @@ export function AgentDock({
           text,
           media: submissionAttachments,
         });
-        setAttachments([]);
+        updateAttachments([]);
         setClientOperationID(createOperationKey());
         setMediaError('');
         stream.clearAssistantText();
@@ -393,8 +462,11 @@ export function AgentDock({
     },
     onError: (_error, { text, isCurrentUI }) => {
       if (!isCurrentUI()) return;
-      setInput(text);
+      setInput((current) => (!current || current === text ? text : `${text}\n\n${current}`));
       setOptimisticInput(undefined);
+    },
+    onSettled: (_data, _error, { attachmentWorkKey: submittedKey }) => {
+      if (submittingAttachmentsFor.current === submittedKey) submittingAttachmentsFor.current = undefined;
     },
   });
   const sendingCurrent = sending.isPending && sending.variables?.isCurrentUI();
@@ -409,10 +481,6 @@ export function AgentDock({
       ]);
     },
   });
-  const conversationTurns = useMemo(
-    () => chronologicalTurns(conversation.data?.pages ?? []),
-    [conversation.data],
-  );
   const hasKnownConversation = Boolean(snapshot.data?.turns.length || conversationTurns.length);
   const conversationHistoryInitializing = isConversationHistoryInitializing(conversation.error);
   const optimistic = optimisticInput;
@@ -425,7 +493,7 @@ export function AgentDock({
   const optimisticSnapshotTurn = optimistic?.turnID
     ? snapshot.data?.turns.find((turn) => turn.id === optimistic.turnID)
     : undefined;
-  const optimisticTurn = optimisticConversationTurn ?? optimisticSnapshotTurn;
+  const optimisticTurn = optimisticSnapshotTurn ?? optimisticConversationTurn;
   const liveReplyIsCanonical = conversationTurns.some(
     ({ turn, messages }) =>
       turn.id === stream.assistantTurnID && messages.some((message) => message.role === 'assistant'),
@@ -453,12 +521,6 @@ export function AgentDock({
     [conversationTurns, optimistic, optimisticVisible, optimisticFollowsStream],
   );
   const liveTurnIsCanonical = conversationTurns.some(({ turn }) => turn.id === stream.assistantTurnID);
-  const liveTurn =
-    [...conversationTurns].reverse().find(({ turn }) => isLiveTurnStatus(turn.status))?.turn ??
-    [...(snapshot.data?.turns ?? [])]
-      .sort(compareTurns)
-      .reverse()
-      .find((turn) => isLiveTurnStatus(turn.status));
   const optimisticLiveStatus = optimisticVisible
     ? optimisticTurn && isLiveTurnStatus(optimisticTurn.status)
       ? optimisticTurn.status
@@ -469,6 +531,84 @@ export function AgentDock({
           : 'connecting'
     : '';
   const liveStatus = liveTurn?.status ?? optimisticLiveStatus;
+  const liveProgress = [
+    stream.retryingTurnID === liveTurn?.id && stream.retryingTurnID
+      ? progressCopy.retrying
+      : stream.activity
+        ? t('agent.usingTool', { tool: stream.activity })
+        : liveStatus === 'running'
+          ? progressCopy.waitingForModel
+          : '',
+    elapsedSeconds !== undefined ? `${progressCopy.elapsed} ${formatAgentElapsed(elapsedSeconds)}` : '',
+  ]
+    .filter(Boolean)
+    .join(' · ');
+  const compacting = useMutation({
+    mutationFn: ({
+      sessionID: targetSessionID,
+    }: {
+      sessionID: string;
+      key: string;
+      isCurrentUI: () => boolean;
+    }) => compactSessionContext(targetSessionID),
+    retry: false,
+    onSettled: async (_result, _error, { sessionID: targetSessionID, key }) => {
+      try {
+        await Promise.all([
+          queryClient.invalidateQueries({ queryKey: ['agent-session', targetSessionID], refetchType: 'all' }),
+          queryClient.invalidateQueries({ queryKey: ['agent-conversation', targetSessionID] }),
+        ]);
+      } finally {
+        compactionRequests.current.delete(key);
+        setPendingCompactions(new Set(compactionRequests.current));
+      }
+    },
+  });
+  const contextCompacting =
+    pendingCompactions.has(compactionKey) || snapshot.data?.context_compacting === true;
+  const compactionResultCurrent = compacting.variables?.isCurrentUI() ?? false;
+  const canCompactContext = Boolean(
+    sessionID &&
+    canSend &&
+    runtimeReady &&
+    snapshot.data &&
+    !liveStatus &&
+    !sendingCurrent &&
+    !preparing &&
+    !uploadingMedia &&
+    !contextCompacting,
+  );
+  function organizeContext() {
+    if (
+      !sessionID ||
+      !canCompactContext ||
+      compactionRequests.current.has(compactionKey) ||
+      submittingAttachmentsFor.current === attachmentWork.current.key ||
+      attachmentWork.current.reserved > 0
+    )
+      return;
+    const view = compactionView.current;
+    compactionRequests.current.add(compactionKey);
+    setPendingCompactions(new Set(compactionRequests.current));
+    setSessionMenuOpen(false);
+    compacting.mutate({
+      sessionID,
+      key: compactionKey,
+      isCurrentUI: () => compactionView.current === view,
+    });
+  }
+  const previousCompaction = useRef({ sessionID, compacting: false });
+  useEffect(() => {
+    if (
+      previousCompaction.current.sessionID === sessionID &&
+      previousCompaction.current.compacting &&
+      snapshot.data &&
+      !snapshot.data.context_compacting
+    ) {
+      void queryClient.invalidateQueries({ queryKey: ['agent-conversation', sessionID] });
+    }
+    previousCompaction.current = { sessionID, compacting: snapshot.data?.context_compacting === true };
+  }, [queryClient, sessionID, snapshot.data?.context_compacting]);
   const interrupting = useMutation({
     mutationFn: ({ sessionID: targetSessionID, turnID }: { sessionID: string; turnID: string }) =>
       interruptAgentTurn(targetSessionID, turnID),
@@ -511,8 +651,8 @@ export function AgentDock({
   useEffect(() => {
     setFollowLatest(true);
     setModel('');
-    setAttachments([]);
-    setUploadingMedia(false);
+    updateAttachments([]);
+    setPendingMediaCount(0);
     setClientOperationID(createOperationKey());
     setMediaError('');
     setAssetPickerOpen(false);
@@ -650,44 +790,102 @@ export function AgentDock({
     historyRef.current?.scrollTo({ top: historyRef.current.scrollHeight, behavior: 'smooth' });
   }
 
-  async function attachFiles(event: ChangeEvent<HTMLInputElement>) {
+  function attachFiles(event: ChangeEvent<HTMLInputElement>) {
     const files = [...(event.target.files ?? [])];
     event.target.value = '';
+    attachImageFiles(files);
+  }
+
+  function pasteImages(event: ClipboardEvent<HTMLTextAreaElement>) {
+    // The textarea keeps its native text paste behavior, including mixed
+    // image/plain-text payloads. Only actual clipboard Files become attachments.
+    attachImageFiles(clipboardImageFiles(event.clipboardData));
+  }
+
+  function mediaFailureMessage(error: unknown) {
+    const failure = error instanceof APIError ? error : undefined;
+    const message = conversationMediaCopy[agentMediaErrorMessageKey(failure?.code, failure?.status)];
+    return failure?.requestID
+      ? `${message} ${conversationMediaCopy.requestID} ${failure.requestID}`
+      : message;
+  }
+
+  function reserveAttachmentSlots(count: number): AttachmentWork | undefined {
+    const work = attachmentWork.current;
+    if (attachmentsRef.current.length + work.reserved + count > maximumAgentAttachments) {
+      setMediaError(conversationMediaCopy.imageLimit);
+      return undefined;
+    }
+    work.reserved += count;
+    setPendingMediaCount(work.reserved);
+    return work;
+  }
+
+  function attachmentSubmissionBlocked() {
+    if (sendingCurrent || submittingAttachmentsFor.current === attachmentWork.current.key) {
+      setMediaError(conversationMediaCopy.whileSubmitting);
+      return true;
+    }
+    return false;
+  }
+
+  function releaseAttachmentSlots(work: AttachmentWork, count: number) {
+    work.reserved -= count;
+    if (attachmentWork.current === work) setPendingMediaCount(work.reserved);
+  }
+
+  function attachImageFiles(files: File[]) {
     if (!sessionID || !files.length) return;
+    if (attachmentSubmissionBlocked()) return;
     if (!selectedModelMatchesSession) {
       setMediaError(conversationMediaCopy.switchSessionFirst);
       return;
     }
-    if (attachments.length + files.length > 5 || files.some((file) => !file.type.startsWith('image/'))) {
-      setMediaError(conversationMediaCopy.imageLimit);
+    const prepared = prepareAgentImageFiles(files);
+    if (prepared.errorCode) {
+      setMediaError(conversationMediaCopy[agentMediaErrorMessageKey(prepared.errorCode)]);
       return;
     }
-    const isCurrent = captureReceivingContext();
-    if (!isCurrent()) return;
-    setUploadingMedia(true);
+    const receiving = captureReceivingContext();
+    if (!receiving()) return;
+    const work = reserveAttachmentSlots(prepared.files.length);
+    if (!work) return;
+    const isCurrent = () => attachmentWork.current === work && receiving();
     setMediaError('');
-    try {
-      for (const file of files) {
-        const uploaded = (await uploadAgentMedia(sessionID, clientOperationID, file)).media;
-        if (!isCurrent()) return;
-        setAttachments((current) => uniqueMedia([...current, uploaded]));
+    const upload = async () => {
+      let remaining = prepared.files.length;
+      try {
+        for (const file of prepared.files) {
+          if (!isCurrent()) return;
+          const uploaded = (await uploadAgentMedia(sessionID, clientOperationID, file)).media;
+          if (!isCurrent()) return;
+          updateAttachments((current) => uniqueMedia([...current, uploaded]));
+          remaining -= 1;
+          releaseAttachmentSlots(work, 1);
+        }
+      } catch (error) {
+        if (isCurrent()) setMediaError(mediaFailureMessage(error));
+      } finally {
+        releaseAttachmentSlots(work, remaining);
       }
-    } catch (error) {
-      if (isCurrent())
-        setMediaError(error instanceof Error ? error.message : conversationMediaCopy.uploadFailed);
-    } finally {
-      if (isCurrent()) setUploadingMedia(false);
-    }
+    };
+    // A synchronous reservation makes successive paste events safe before the
+    // next React render; the queue serializes file uploads within this draft.
+    work.queue = work.queue.then(upload, upload);
   }
 
   async function attachAsset(asset: EpisodeAsset) {
     if (!sessionID) return;
-    const isCurrent = captureReceivingContext();
-    if (!isCurrent()) return;
-    if (attachments.length >= 5) {
-      setMediaError(conversationMediaCopy.imageLimit);
+    if (attachmentSubmissionBlocked()) return;
+    if (!selectedModelMatchesSession) {
+      setMediaError(conversationMediaCopy.switchSessionFirst);
       return;
     }
+    const receiving = captureReceivingContext();
+    if (!receiving()) return;
+    const work = reserveAttachmentSlots(1);
+    if (!work) return;
+    const isCurrent = () => attachmentWork.current === work && receiving();
     setMediaError('');
     try {
       const details = await getMediaSlot(projectID, asset.primary_image_slot_id, false);
@@ -696,8 +894,11 @@ export function AgentDock({
         (candidate) => candidate.media_version_id === details.slot.current_media_version_id,
       );
       const artifact = details.artifacts.find((candidate) => candidate.artifact_id === version?.artifact_id);
-      if (!artifact) throw new Error(conversationMediaCopy.assetHasNoImage);
-      setAttachments((current) =>
+      if (!artifact) {
+        setMediaError(conversationMediaCopy.assetHasNoImage);
+        return;
+      }
+      updateAttachments((current) =>
         uniqueMedia([
           ...current,
           {
@@ -717,20 +918,26 @@ export function AgentDock({
       setAssetPickerOpen(false);
       requestAnimationFrame(() => inputRef.current?.focus());
     } catch (error) {
-      if (isCurrent())
-        setMediaError(error instanceof Error ? error.message : conversationMediaCopy.assetHasNoImage);
+      if (isCurrent()) setMediaError(mediaFailureMessage(error));
+    } finally {
+      releaseAttachmentSlots(work, 1);
     }
   }
 
   function attachReferenceMedia(value: EpisodeReferenceMedia) {
     if (!sessionID || !captureReceivingContext()()) return;
-    if (value.artifact.kind === 'image' && attachments.length >= 5) {
+    if (attachmentSubmissionBlocked()) return;
+    if (
+      value.artifact.kind === 'image' &&
+      !attachmentsRef.current.some((media) => media.artifact_id === value.artifact.artifact_id) &&
+      attachmentsRef.current.length + attachmentWork.current.reserved >= maximumAgentAttachments
+    ) {
       setMediaError(conversationMediaCopy.imageLimit);
       return;
     }
     setMediaError('');
     if (value.artifact.kind === 'image')
-      setAttachments((current) => uniqueMedia([...current, conversationMediaFromReference(value)]));
+      updateAttachments((current) => uniqueMedia([...current, conversationMediaFromReference(value)]));
     appendMention(value.name);
     setAssetPickerOpen(false);
     requestAnimationFrame(() => inputRef.current?.focus());
@@ -746,7 +953,15 @@ export function AgentDock({
   }
 
   function continueWithMedia(media: AgentConversationMedia) {
-    setAttachments((current) => uniqueMedia([...current, media]).slice(0, 5));
+    if (attachmentSubmissionBlocked()) return;
+    if (
+      !attachmentsRef.current.some((value) => value.artifact_id === media.artifact_id) &&
+      attachmentsRef.current.length + attachmentWork.current.reserved >= maximumAgentAttachments
+    ) {
+      setMediaError(conversationMediaCopy.imageLimit);
+      return;
+    }
+    updateAttachments((current) => uniqueMedia([...current, media]));
     setMediaError('');
     requestAnimationFrame(() => inputRef.current?.focus());
   }
@@ -775,6 +990,11 @@ export function AgentDock({
       !selectedModel ||
       (!selectedModelMatchesSession && !runtimeReady) ||
       sendingCurrent ||
+      submittingAttachmentsFor.current === attachmentWork.current.key ||
+      uploadingMedia ||
+      attachmentWork.current.reserved > 0 ||
+      contextCompacting ||
+      compactionRequests.current.has(compactionKey) ||
       preparing ||
       latestPreparation?.status === 'preparing' ||
       latestPreparation?.status === 'failed' ||
@@ -825,6 +1045,9 @@ export function AgentDock({
     const submittedVideoPromptTarget = steering
       ? submittedContext?.videoPromptTarget
       : currentVideoPromptTarget;
+    // Lock synchronously: a paste in the same event tick must not create
+    // another attachment for an operation that is already being submitted.
+    submittingAttachmentsFor.current = attachmentWork.current.key;
     sending.mutate({
       projectID,
       episodeID,
@@ -834,6 +1057,7 @@ export function AgentDock({
       focus: submittedContext?.focus ?? focus,
       attachments,
       clientOperationID,
+      attachmentWorkKey: attachmentWork.current.key,
       isCurrentUI: captureReceivingContext(targetSessionID),
       ...(submittedVideoPromptTarget ? { videoPromptTarget: submittedVideoPromptTarget } : {}),
     });
@@ -960,7 +1184,7 @@ export function AgentDock({
               }))}
               placeholder={t('agent.model')}
               compact
-              disabled={Boolean(liveStatus) || sendingCurrent || preparing}
+              disabled={Boolean(liveStatus) || sendingCurrent || preparing || contextCompacting}
               onChange={(value) => {
                 setModel(value);
                 const [runtimeKind, modelID] = value.split('\u001f') as [
@@ -1014,7 +1238,18 @@ export function AgentDock({
                       </button>
                     ))}
                   </div>
-                  <footer className="agent-session-menu__actions">{newSessionControls()}</footer>
+                  <footer className="agent-session-menu__actions">
+                    <button
+                      type="button"
+                      className="button button--secondary"
+                      title={t('agent.compactContextHint')}
+                      disabled={!canCompactContext}
+                      onClick={organizeContext}
+                    >
+                      {t('agent.compactContext')}
+                    </button>
+                    {newSessionControls()}
+                  </footer>
                 </div>
               )}
             </div>
@@ -1162,6 +1397,7 @@ export function AgentDock({
                       projectID={projectID}
                       media={item}
                       copy={conversationMediaCopy}
+                      continueDisabled={Boolean(sendingCurrent)}
                       onContinue={() => continueWithMedia(item)}
                       onSave={() => setMediaAction({ media: item })}
                     />
@@ -1232,7 +1468,7 @@ export function AgentDock({
                 live
                 status={liveStatus}
                 label={t(`agent.turn.${liveStatus}`, { defaultValue: liveStatus })}
-                detail={stream.activity ? t('agent.usingTool', { tool: stream.activity }) : undefined}
+                detail={liveProgress || undefined}
               />
             )}
             {!followLatest && (
@@ -1243,6 +1479,21 @@ export function AgentDock({
           </div>
           {canSend ? (
             <form className="agent-composer" onSubmit={submit}>
+              {contextCompacting && (
+                <div role="status" className="agent-history-note">
+                  {t('agent.contextCompacting')}
+                </div>
+              )}
+              {compactionResultCurrent && compacting.isSuccess && !contextCompacting && (
+                <div role="status" className="agent-history-note">
+                  {t('agent.contextCompacted')}
+                </div>
+              )}
+              {compactionResultCurrent && compacting.isError && (
+                <div role="alert" className="form-error">
+                  {t(contextCompactionErrorKey(compacting.error))}
+                </div>
+              )}
               {sending.isError && sending.variables?.isCurrentUI() && (
                 <div role="alert" className="form-error">
                   {businessErrorMessage(businessErrorCode(sending.error), t) ?? t('businessErrors.unknown')}
@@ -1265,7 +1516,7 @@ export function AgentDock({
                         type="button"
                         aria-label={conversationMediaCopy.remove}
                         onClick={() =>
-                          setAttachments((current) =>
+                          updateAttachments((current) =>
                             current.filter((item) => item.artifact_id !== media.artifact_id),
                           )
                         }
@@ -1279,6 +1530,8 @@ export function AgentDock({
               <textarea
                 ref={inputRef}
                 value={input}
+                onPaste={pasteImages}
+                title={conversationMediaCopy.pasteHint}
                 onChange={(event) => {
                   const next = event.target.value;
                   setInput(next);
@@ -1299,16 +1552,19 @@ export function AgentDock({
                     ref={fileInputRef}
                     className="agent-media-file-input"
                     type="file"
-                    accept="image/*"
+                    accept=".png,.jpg,.jpeg,.webp,image/png,image/jpeg,image/webp"
                     multiple
                     onChange={(event) => void attachFiles(event)}
                   />
                   <button
                     type="button"
                     className="agent-composer-tool"
-                    title={conversationMediaCopy.upload}
+                    title={`${conversationMediaCopy.upload} · ${conversationMediaCopy.pasteHint}`}
                     aria-label={conversationMediaCopy.upload}
-                    disabled={uploadingMedia || attachments.length >= 5}
+                    disabled={
+                      Boolean(sendingCurrent) ||
+                      attachments.length + pendingMediaCount >= maximumAgentAttachments
+                    }
                     onClick={() => fileInputRef.current?.click()}
                   >
                     ＋
@@ -1319,6 +1575,7 @@ export function AgentDock({
                       className="agent-composer-tool"
                       title={conversationMediaCopy.mentionReference}
                       aria-label={conversationMediaCopy.mentionReference}
+                      disabled={Boolean(sendingCurrent)}
                       onClick={() => setAssetPickerOpen((open) => !open)}
                     >
                       @
@@ -1327,7 +1584,12 @@ export function AgentDock({
                       <div className="agent-asset-mention__menu">
                         <strong>{conversationMediaCopy.chooseAsset}</strong>
                         {(assets.data?.assets ?? []).map((asset) => (
-                          <button type="button" key={asset.asset_id} onClick={() => void attachAsset(asset)}>
+                          <button
+                            type="button"
+                            key={asset.asset_id}
+                            disabled={Boolean(sendingCurrent)}
+                            onClick={() => void attachAsset(asset)}
+                          >
                             <span>{asset.identity.name}</span>
                             <small>{asset.identity.kind}</small>
                           </button>
@@ -1337,6 +1599,7 @@ export function AgentDock({
                           <button
                             type="button"
                             key={item.artifact.artifact_id}
+                            disabled={Boolean(sendingCurrent)}
                             onClick={() => attachReferenceMedia(item)}
                           >
                             <span>{item.name}</span>
@@ -1361,7 +1624,7 @@ export function AgentDock({
                       </div>
                     )}
                   </div>
-                  <span role={interrupting.isError ? 'alert' : undefined}>
+                  <span role={mediaError || interrupting.isError ? 'alert' : undefined}>
                     {mediaError ||
                       (interrupting.isError
                         ? t('agent.stopFailed')
@@ -1387,7 +1650,14 @@ export function AgentDock({
                 ) : (
                   <button
                     className="send-button"
-                    disabled={!input.trim() || !selectedModel || sendingCurrent || preparing}
+                    disabled={
+                      !input.trim() ||
+                      !selectedModel ||
+                      sendingCurrent ||
+                      preparing ||
+                      contextCompacting ||
+                      uploadingMedia
+                    }
                     aria-label={t('agent.send')}
                   >
                     ↑
@@ -1456,12 +1726,14 @@ function ConversationMediaResult({
   projectID,
   media,
   copy,
+  continueDisabled,
   onContinue,
   onSave,
 }: {
   projectID: string;
   media: AgentConversationMedia;
   copy: ConversationMediaCopy;
+  continueDisabled: boolean;
   onContinue: () => void;
   onSave: () => void;
 }) {
@@ -1470,7 +1742,7 @@ function ConversationMediaResult({
     <article className="conversation-media-result">
       <img src={url} alt={media.name} />
       <div>
-        <button type="button" onClick={onContinue}>
+        <button type="button" disabled={continueDisabled} onClick={onContinue}>
           {copy.continueEdit}
         </button>
         <button type="button" onClick={onSave}>
@@ -1714,9 +1986,23 @@ function conversationMediaFromReference(value: EpisodeReferenceMedia): AgentConv
   };
 }
 
+const agentProgressCopy = {
+  zh: {
+    retrying: '连接中断，正在重试…',
+    waitingForModel: '正在等待模型响应',
+    elapsed: '已耗时',
+  },
+  en: {
+    retrying: 'Connection interrupted. Retrying…',
+    waitingForModel: 'Waiting for the model response',
+    elapsed: 'Elapsed',
+  },
+} as const;
+
 const mediaCopy = {
   zh: {
     upload: '上传图片到当前对话',
+    pasteHint: '也可在输入框粘贴截图或复制的图像。',
     mentionReference: '引用资产或上传素材',
     chooseAsset: '选择资产',
     chooseUploadedMedia: '选择上传素材',
@@ -1725,9 +2011,17 @@ const mediaCopy = {
     uploadedAudio: '上传音频',
     noReferences: '暂无可引用的资产或上传素材',
     referenceMediaLoadFailed: '上传素材暂时无法加载',
-    uploading: '正在上传图片…',
-    uploadFailed: '图片上传失败',
-    imageLimit: '最多附加 5 张图片，且仅支持图片文件。',
+    uploading: '正在准备图片附件…',
+    unsupportedType: '仅支持 PNG、JPEG 或 WebP 图片。',
+    tooLarge: '每张图片不能超过 25 MiB。',
+    invalidMedia: '无法识别这张图片，或图片数据不完整。请换一张 PNG、JPEG 或 WebP 图片。',
+    unreadableMedia: '无法读取图片或保存附件，请检查文件及项目目录权限后重试。',
+    importUnavailable: '图片处理组件暂不可用，请重启 ShotForward 后重试。',
+    sessionExpired: '本地会话已失效，请重新打开当前会话后重试。',
+    uploadFailed: '图片上传失败，草稿和已添加附件已保留。请稍后重试。',
+    whileSubmitting: '消息正在提交，请完成后再添加图片。',
+    requestID: '请求编号：',
+    imageLimit: '每条消息最多附加 5 张图片（含正在准备的图片）。',
     assetHasNoImage: '这个资产还没有当前图片版本。',
     switchSessionFirst: '附件属于当前会话；请先切换或新建会话，再添加附件。',
     remove: '移除附件',
@@ -1766,6 +2060,7 @@ const mediaCopy = {
   },
   en: {
     upload: 'Upload images to this conversation',
+    pasteHint: 'You can also paste a screenshot or a copied image into the message box.',
     mentionReference: 'Reference an Asset or uploaded medium',
     chooseAsset: 'Choose Asset',
     chooseUploadedMedia: 'Choose uploaded media',
@@ -1774,9 +2069,19 @@ const mediaCopy = {
     uploadedAudio: 'Uploaded audio',
     noReferences: 'No Assets or uploaded media available',
     referenceMediaLoadFailed: 'Uploaded media could not be loaded',
-    uploading: 'Uploading images…',
-    uploadFailed: 'Image upload failed',
-    imageLimit: 'Attach up to 5 image files.',
+    uploading: 'Preparing image attachments…',
+    unsupportedType: 'Use a PNG, JPEG, or WebP image.',
+    tooLarge: 'Each image must be 25 MiB or smaller.',
+    invalidMedia:
+      'This image could not be recognized or is incomplete. Choose another PNG, JPEG, or WebP image.',
+    unreadableMedia:
+      'The image could not be read or saved. Check the file and project folder permissions, then try again.',
+    importUnavailable: 'Image processing is unavailable. Restart ShotForward and try again.',
+    sessionExpired: 'The local session has expired. Reopen the conversation and try again.',
+    uploadFailed: 'Image upload failed. Your draft and attached images are kept. Try again.',
+    whileSubmitting: 'Your message is being submitted. Add images after it finishes.',
+    requestID: 'Request ID:',
+    imageLimit: 'Attach up to 5 images per message, including pending images.',
     assetHasNoImage: 'This Asset has no current image version.',
     switchSessionFirst:
       'Attachments belong to the current session. Switch or create the session before attaching them.',
@@ -1917,6 +2222,20 @@ function chronologicalTurns(pages: { turns: AgentConversationTurn[] }[]): AgentC
 
 function compareTurns(left: { id: string; created_at: string }, right: { id: string; created_at: string }) {
   return left.created_at.localeCompare(right.created_at) || left.id.localeCompare(right.id);
+}
+
+function contextCompactionErrorKey(error: unknown) {
+  if (error instanceof APIError) {
+    if (
+      error.code === 'context_compaction_unavailable' ||
+      error.code === 'compaction_unavailable' ||
+      error.status === 404
+    )
+      return 'agent.contextCompactionUnavailable';
+    if (error.code === 'context_compaction_busy') return 'agent.contextCompactionBusy';
+    if (error.code === 'context_compaction_timeout') return 'agent.contextCompactionTimeout';
+  }
+  return 'agent.contextCompactionFailed';
 }
 
 function isLiveTurnStatus(status: string) {

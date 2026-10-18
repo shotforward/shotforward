@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log/slog"
 	"net/http"
 	"net/url"
 	"runtime"
@@ -22,6 +23,7 @@ import (
 const refreshCredentialReference = "shotforward_cloud_refresh_token"
 const agentModelCacheTTL = time.Minute
 const agentModelFetchTimeout = 15 * time.Second
+const maxOpenAIProxyRequestBytes = 64 << 20
 
 var (
 	ErrLoginRequired    = errors.New("ShotForward cloud login required")
@@ -104,6 +106,9 @@ type Manager struct {
 	apiBase       *url.URL
 	webBase       *url.URL
 	http          *http.Client
+	agentHTTP     *http.Client
+	proxyTimeouts agentProxyTimeouts
+	proxyLogger   *slog.Logger // guarded by mu
 	credentials   CredentialStore
 	mu            sync.Mutex
 	accessToken   string
@@ -155,7 +160,15 @@ func NewManagerWithWebURL(apiBaseURL, webBaseURL string, credentials CredentialS
 	if client == nil {
 		client = &http.Client{Timeout: 90 * time.Second}
 	}
-	return &Manager{apiBase: apiBase, webBase: webBase, credentials: credentials, http: client}, nil
+	// A Client timeout includes reading the entire response body, so it must not
+	// bound a live Agent stream. Copy the Client, not its Transport: proxy, TLS,
+	// redirect, and cookie policies remain identical without mutating the caller.
+	agentClient := *client
+	agentClient.Timeout = 0
+	return &Manager{
+		apiBase: apiBase, webBase: webBase, credentials: credentials, http: client,
+		agentHTTP: &agentClient, proxyTimeouts: defaultAgentProxyTimeouts(), proxyLogger: slog.Default(),
+	}, nil
 }
 
 func parseBaseURL(value string) (*url.URL, error) {
@@ -445,20 +458,43 @@ func (m *Manager) clearAgentModelCache() {
 // child receives only a process-local capability; cloud access/refresh tokens
 // remain owned by this manager.
 func (m *Manager) ProxyOpenAI(w http.ResponseWriter, r *http.Request, suffix string) {
-	if suffix != "/models" && suffix != "/responses" {
+	if suffix != "/models" && suffix != "/responses" && suffix != "/responses/compact" {
 		http.NotFound(w, r)
 		return
 	}
+	if suffix == "/responses/compact" && r.Method != http.MethodPost {
+		w.Header().Set("Allow", http.MethodPost)
+		w.WriteHeader(http.StatusMethodNotAllowed)
+		return
+	}
 	if err := m.ensureAccess(r.Context()); err != nil {
-		writeError(w, err)
+		if r.Context().Err() == nil {
+			writeError(w, err)
+		}
 		return
 	}
-	body, err := io.ReadAll(io.LimitReader(r.Body, 8<<20))
+	// Read one byte beyond the limit so a large conversation cannot become a
+	// successful HTTP request containing a silently truncated JSON body. Treat
+	// encoded request bodies as opaque bytes, including compressed bodies.
+	body, err := io.ReadAll(io.LimitReader(r.Body, maxOpenAIProxyRequestBytes+1))
 	if err != nil {
-		writeError(w, err)
+		if r.Context().Err() == nil {
+			writeError(w, err)
+		}
 		return
 	}
-	request, err := http.NewRequestWithContext(r.Context(), r.Method, m.apiBase.ResolveReference(&url.URL{Path: "/v1" + suffix}).String(), bytes.NewReader(body))
+	if len(body) > maxOpenAIProxyRequestBytes {
+		writeJSON(w, http.StatusRequestEntityTooLarge, map[string]any{"error": map[string]any{
+			"message": "Responses request body exceeds the 64 MiB limit",
+			"type":    "invalid_request_error",
+			"param":   nil,
+			"code":    "request_too_large",
+		}})
+		return
+	}
+	proxyContext, cancel := context.WithCancelCause(r.Context())
+	defer cancel(nil)
+	request, err := http.NewRequestWithContext(proxyContext, r.Method, m.apiBase.ResolveReference(&url.URL{Path: "/v1" + suffix}).String(), bytes.NewReader(body))
 	if err != nil {
 		writeError(w, err)
 		return
@@ -466,7 +502,7 @@ func (m *Manager) ProxyOpenAI(w http.ResponseWriter, r *http.Request, suffix str
 	// Forward session metadata unchanged for protocol compatibility.
 	// Do not persist these headers locally.
 	for _, name := range []string{
-		"Accept", "Content-Type", "OpenAI-Beta", "Idempotency-Key",
+		"Accept", "Content-Type", "Content-Encoding", "OpenAI-Beta", "Idempotency-Key",
 		"Session-ID", "Thread-ID", "Traceparent", "Tracestate",
 		"X-Codex-Turn-Metadata", "X-Codex-Turn-State",
 	} {
@@ -480,19 +516,45 @@ func (m *Manager) ProxyOpenAI(w http.ResponseWriter, r *http.Request, suffix str
 	token := m.accessToken
 	m.mu.Unlock()
 	request.Header.Set("Authorization", "Bearer "+token)
-	response, err := m.http.Do(request)
+	client := m.http
+	var watchdog *agentProxyWatchdog
+	started := time.Now()
+	if suffix != "/models" {
+		client = m.agentHTTP
+		watchdog = newAgentProxyWatchdog(cancel, m.proxyTimeouts.header, errAgentProxyHeaderTimeout)
+		defer watchdog.stop()
+	}
+	response, err := client.Do(request)
 	if err != nil {
-		writeError(w, err)
+		m.failAgentProxy(w, r, suffix, "headers", proxyContext, err, 0, 0, started, false)
 		return
 	}
-	defer response.Body.Close()
+	upstreamBody := &agentProxyCloseOnceBody{ReadCloser: response.Body}
+	response.Body = upstreamBody
+	defer upstreamBody.Close()
+	if proxyContext.Err() != nil {
+		m.failAgentProxy(w, r, suffix, "headers", proxyContext, proxyContext.Err(), response.StatusCode, 0, started, false)
+		return
+	}
+	if watchdog != nil {
+		watchdog.reset(m.proxyTimeouts.readIdle, errAgentProxyReadIdleTimeout)
+		response.Body = &agentProxyActivityBody{ReadCloser: upstreamBody, watchdog: watchdog, timeout: m.proxyTimeouts.readIdle}
+	}
+	// Cancellation also closes a custom Transport's body. This makes an idle
+	// read releasable without spawning a new goroutine for each streamed chunk.
+	stopClose := context.AfterFunc(proxyContext, func() { _ = upstreamBody.Close() })
+	defer stopClose()
 	for _, name := range []string{"Content-Type", "Cache-Control", "X-Request-ID", "X-Codex-Turn-State"} {
 		if value := response.Header.Get(name); value != "" {
 			w.Header().Set(name, value)
 		}
 	}
 	if response.StatusCode == http.StatusPaymentRequired {
-		errorBody, _ := io.ReadAll(io.LimitReader(response.Body, 64<<10))
+		errorBody, readErr := io.ReadAll(io.LimitReader(response.Body, 64<<10))
+		if readErr != nil {
+			m.failAgentProxy(w, r, suffix, "read", proxyContext, readErr, response.StatusCode, 0, started, false)
+			return
+		}
 		threadID := r.Header.Get("Thread-ID")
 		if threadID == "" {
 			threadID = r.Header.Get("Session-ID")
@@ -508,21 +570,7 @@ func (m *Manager) ProxyOpenAI(w http.ResponseWriter, r *http.Request, suffix str
 		m.recordAgentFailure(threadID, cloudErrorCode(response.StatusCode, errorBody))
 		response.Body = io.NopCloser(io.MultiReader(bytes.NewReader(errorBody), response.Body))
 	}
-	w.WriteHeader(response.StatusCode)
-	if flusher, ok := w.(http.Flusher); ok {
-		buffer := make([]byte, 32<<10)
-		for {
-			count, readErr := response.Body.Read(buffer)
-			if count > 0 {
-				_, _ = w.Write(buffer[:count])
-				flusher.Flush()
-			}
-			if readErr != nil {
-				return
-			}
-		}
-	}
-	_, _ = io.Copy(w, response.Body)
+	m.forwardAgentProxyBody(w, r, suffix, response, proxyContext, cancel, watchdog, started)
 }
 
 func (m *Manager) DoAuthenticated(ctx context.Context, method, path string, body any, output any) error {

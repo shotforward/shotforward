@@ -15,7 +15,9 @@ import (
 	"time"
 )
 
-const maxRPCMessageBytes = 4 << 20
+// Full-history responses and turn notifications can contain several base64
+// images. Match the cloud proxy's bounded message limit without truncating JSON.
+const maxRPCMessageBytes = 64 << 20
 
 type rpcError struct {
 	Method  string

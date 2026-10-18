@@ -67,7 +67,11 @@ func (p Processor) Prepare(ctx context.Context, request projectapp.PrepareMediaR
 		return projectapp.PreparedMedia{}, fmt.Errorf("%w: file size is outside the supported range", projectapp.ErrMediaImportInvalid)
 	}
 	ext := strings.ToLower(filepath.Ext(request.SourcePath))
-	if !supportedExtension(request.Kind, ext) {
+	if request.Kind == domain.MediaKindImage {
+		// Image names from browsers/providers do not reliably describe their bytes.
+		// Sniff the bounded staging copy, never the mutable original source.
+		ext = ""
+	} else if !supportedExtension(request.Kind, ext) {
 		return projectapp.PreparedMedia{}, projectapp.ErrMediaImportUnsupported
 	}
 	stageRoot := filepath.Join(request.ProjectRoot, filepath.FromSlash(stagingDirectory))
@@ -98,9 +102,24 @@ func (p Processor) Prepare(ctx context.Context, request projectapp.PrepareMediaR
 	if err := staged.Close(); err != nil {
 		return projectapp.PreparedMedia{}, fmt.Errorf("%w: close staging file: %v", projectapp.ErrMediaImportUnreadable, err)
 	}
+	if request.Kind == domain.MediaKindImage {
+		ext, err = stagedImageExtension(stagedPath)
+		if err != nil {
+			return projectapp.PreparedMedia{}, err
+		}
+		stagedPath, err = normalizeStagedImagePath(stagedPath, ext)
+		if err != nil {
+			return projectapp.PreparedMedia{}, err
+		}
+	}
 	metadata, err := p.probe(ctx, stagedPath, request.Kind, ext)
 	if err != nil {
 		return projectapp.PreparedMedia{}, err
+	}
+	if request.Kind == domain.MediaKindImage {
+		if err := p.validateStagedImage(ctx, stagedPath, ext, metadata.Width, metadata.Height); err != nil {
+			return projectapp.PreparedMedia{}, err
+		}
 	}
 	if request.Kind != domain.MediaKindImage && (request.TrimStartMilliseconds != 0 || request.TrimEndMilliseconds != 0) {
 		trimEnd := request.TrimEndMilliseconds
@@ -362,7 +381,12 @@ type probeOutput struct {
 }
 
 func (p Processor) probe(ctx context.Context, path string, kind domain.MediaKind, extension string) (projectapp.PreparedMedia, error) {
-	command := exec.CommandContext(ctx, p.ffprobe, "-v", "error", "-show_streams", "-show_format", "-of", "json", path)
+	arguments := []string{"-v", "error"}
+	if kind == domain.MediaKindImage {
+		arguments = append(arguments, "-threads", "1", "-max_pixels", strconv.FormatInt(maximumDecodedImagePixels, 10))
+	}
+	arguments = append(arguments, "-show_streams", "-show_format", "-of", "json", path)
+	command := exec.CommandContext(ctx, p.ffprobe, arguments...)
 	output, err := command.Output()
 	if err != nil {
 		if ctx.Err() != nil {

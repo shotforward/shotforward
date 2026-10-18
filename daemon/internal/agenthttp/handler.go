@@ -10,6 +10,7 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"mime/multipart"
 	"net"
 	"net/http"
 	"net/url"
@@ -35,6 +36,7 @@ import (
 const MaxJSONRequestBytes = 128 * 1024
 const maxAgentMediaUploadBytes = 25 * 1024 * 1024
 const runtimeQueryTimeout = 30 * time.Second
+const contextCompactionTimeout = 3 * time.Minute
 
 var ErrInvalidConfiguration = errors.New("invalid Agent HTTP configuration")
 var diagnosticSecretPattern = regexp.MustCompile(`(?i)(bearer\s+)[^\s]+|(sk-[a-z0-9_-]+)|((?:token|secret|api[_-]?key)\s*[=:]\s*)[^\s,;]+`)
@@ -60,6 +62,11 @@ type SessionCommands interface {
 type TurnCommands interface {
 	SubmitInput(context.Context, agentscheduler.SubmitInput) (agentscheduler.SubmitResult, error)
 	InterruptTurn(context.Context, agent.SessionID, agent.TurnID) (agent.AgentTurn, error)
+}
+
+type contextCompactionCommands interface {
+	CompactSession(context.Context, agent.SessionID) error
+	IsContextCompacting(agent.SessionID) bool
 }
 
 type AgentMediaCommands interface {
@@ -214,6 +221,8 @@ func (h *Handler) ServeHTTP(response http.ResponseWriter, request *http.Request)
 		h.sessionMessages(response, request, requestID, segments[3])
 	case len(segments) == 5 && segments[0] == "api" && segments[1] == "v1" && segments[2] == "agent-sessions" && segments[4] == "inputs" && request.Method == http.MethodPost:
 		h.submitInput(response, request, requestID, segments[3])
+	case len(segments) == 5 && segments[0] == "api" && segments[1] == "v1" && segments[2] == "agent-sessions" && segments[4] == "compact":
+		h.compactSession(response, request, requestID, segments[3])
 	case len(segments) == 5 && segments[0] == "api" && segments[1] == "v1" && segments[2] == "agent-sessions" && segments[4] == "media" && request.Method == http.MethodPost:
 		h.uploadConversationMedia(response, request, requestID, segments[3])
 	case len(segments) == 6 && segments[0] == "api" && segments[1] == "v1" && segments[2] == "agent-sessions" && segments[4] == "turns" && strings.HasSuffix(segments[5], ":interrupt") && request.Method == http.MethodPost:
@@ -502,7 +511,60 @@ func (h *Handler) sessionSnapshot(w http.ResponseWriter, r *http.Request, reques
 	for _, item := range value.ChangeSets {
 		changeSets = append(changeSets, mapChangeSet(item))
 	}
-	h.writeJSON(w, http.StatusOK, map[string]any{"session": mapSession(value.Session), "turns": turns, "change_sets": changeSets, "cursor": cursor, "request_id": requestID})
+	compacting := false
+	if commands, ok := h.turns.(contextCompactionCommands); ok {
+		compacting = commands.IsContextCompacting(sessionID)
+	}
+	h.writeJSON(w, http.StatusOK, map[string]any{"session": mapSession(value.Session), "turns": turns, "change_sets": changeSets, "cursor": cursor, "context_compacting": compacting, "request_id": requestID})
+}
+
+func (h *Handler) compactSession(w http.ResponseWriter, r *http.Request, requestID, rawSessionID string) {
+	if r.Method != http.MethodPost {
+		h.methodNotAllowed(w, requestID)
+		return
+	}
+	sessionID, err := agent.ParseSessionID(rawSessionID)
+	if err != nil {
+		h.writeMappedError(w, requestID, err)
+		return
+	}
+	if err := decodeEmptyJSON(r); err != nil {
+		h.writeMappedError(w, requestID, err)
+		return
+	}
+	ctx, cancel := context.WithTimeout(r.Context(), contextCompactionTimeout)
+	defer cancel()
+	// Snapshot restores the persisted Runtime Thread and verifies its MCP binding
+	// and project scope before the scheduler reserves the idle Session.
+	snapshot, err := h.sessions.Snapshot(ctx, sessionID)
+	if err != nil {
+		if ctx.Err() != nil {
+			h.writeError(w, requestID, mapContextCompactionError(ctx.Err()))
+		} else {
+			h.writeMappedError(w, requestID, err)
+		}
+		return
+	}
+	if snapshot.Session.ID != sessionID || snapshot.Session.Status != agent.SessionActive {
+		h.writeMappedError(w, requestID, agentscheduler.ErrSessionNotActive)
+		return
+	}
+	for _, turn := range snapshot.Turns {
+		if !turn.Status.IsTerminal() {
+			h.writeMappedError(w, requestID, agentapp.ErrContextCompactionBusy)
+			return
+		}
+	}
+	commands, ok := h.turns.(contextCompactionCommands)
+	if !ok {
+		h.writeMappedError(w, requestID, agentapp.ErrContextCompactionUnavailable)
+		return
+	}
+	if err := commands.CompactSession(ctx, sessionID); err != nil {
+		h.writeError(w, requestID, mapContextCompactionError(err))
+		return
+	}
+	h.writeJSON(w, http.StatusOK, map[string]any{"context_compacted": true, "request_id": requestID})
 }
 
 func (h *Handler) sessionMessages(w http.ResponseWriter, r *http.Request, requestID, rawSessionID string) {
@@ -637,46 +699,87 @@ func (h *Handler) uploadConversationMedia(w http.ResponseWriter, r *http.Request
 	}
 	snapshot, err := h.sessions.Snapshot(r.Context(), sessionID)
 	if err != nil {
-		h.writeMappedError(w, requestID, err)
+		h.writeAgentMediaError(w, requestID, "session", err)
 		return
 	}
 	r.Body = http.MaxBytesReader(w, r.Body, maxAgentMediaUploadBytes+1024*1024)
+	defer func() {
+		if r.MultipartForm != nil {
+			_ = r.MultipartForm.RemoveAll()
+		}
+	}()
 	if err := r.ParseMultipartForm(maxAgentMediaUploadBytes); err != nil {
-		h.writeError(w, requestID, apiError(http.StatusBadRequest, "invalid_agent_media", "The image upload is invalid or too large", false, "Choose an image smaller than 25 MB."))
+		var limitError *http.MaxBytesError
+		if errors.As(err, &limitError) || errors.Is(err, multipart.ErrMessageTooLarge) {
+			h.writeAgentMediaError(w, requestID, "multipart", agentMediaTooLargeError())
+		} else {
+			h.writeAgentMediaError(w, requestID, "multipart", apiError(http.StatusBadRequest, "invalid_agent_media", "The image upload is invalid", false, "Choose a PNG, JPEG, or WebP image and retry."))
+		}
 		return
 	}
 	operationID := strings.TrimSpace(r.FormValue("client_operation_id"))
 	file, header, err := r.FormFile("file")
-	if err != nil || operationID == "" {
-		h.writeMappedError(w, requestID, projectapp.ErrInvalidRequest)
+	if err != nil {
+		h.writeAgentMediaError(w, requestID, "file", apiError(http.StatusBadRequest, "invalid_agent_media", "The image upload is missing a file", false, "Choose an image and retry."))
 		return
 	}
 	defer file.Close()
+	if operationID == "" {
+		h.writeAgentMediaError(w, requestID, "operation", projectapp.ErrInvalidRequest)
+		return
+	}
+	if header.Size > maxAgentMediaUploadBytes {
+		h.writeAgentMediaError(w, requestID, "size", agentMediaTooLargeError())
+		return
+	}
 	extension := filepath.Ext(header.Filename)
 	if len(extension) > 12 {
 		extension = ""
 	}
 	temporary, err := os.CreateTemp("", "shotforward-agent-media-*"+extension)
 	if err != nil {
-		h.writeMappedError(w, requestID, err)
+		h.writeAgentMediaError(w, requestID, "temporary_file", errors.Join(projectapp.ErrMediaImportUnavailable, err))
 		return
 	}
 	temporaryPath := temporary.Name()
 	defer os.Remove(temporaryPath)
 	written, copyErr := io.Copy(temporary, io.LimitReader(file, maxAgentMediaUploadBytes+1))
 	closeErr := temporary.Close()
-	if copyErr != nil || closeErr != nil || written > maxAgentMediaUploadBytes {
-		h.writeError(w, requestID, apiError(http.StatusBadRequest, "invalid_agent_media", "The image upload could not be read", false, "Choose an image smaller than 25 MB."))
+	if written > maxAgentMediaUploadBytes {
+		h.writeAgentMediaError(w, requestID, "size", agentMediaTooLargeError())
+		return
+	}
+	if copyErr != nil {
+		h.writeAgentMediaError(w, requestID, "copy", errors.Join(projectapp.ErrMediaImportUnreadable, copyErr))
+		return
+	}
+	if closeErr != nil {
+		h.writeAgentMediaError(w, requestID, "close", errors.Join(projectapp.ErrMediaImportUnavailable, closeErr))
+		return
+	}
+	if written == 0 {
+		h.writeAgentMediaError(w, requestID, "empty_file", projectapp.ErrMediaImportInvalid)
 		return
 	}
 	media, err := h.media.UploadAgentConversationMedia(r.Context(), projectapp.UploadAgentConversationMediaInput{
 		ProjectID: snapshot.Session.ProjectID, EpisodeID: snapshot.Session.EpisodeID, SessionID: sessionID.String(), ClientOperationID: operationID, SourcePath: temporaryPath, OriginalFilename: header.Filename,
 	})
 	if err != nil {
-		h.writeMappedError(w, requestID, err)
+		h.writeAgentMediaError(w, requestID, "import", err)
 		return
 	}
 	h.writeJSON(w, http.StatusCreated, map[string]any{"media": mapConversationMedia(media), "request_id": requestID})
+}
+
+func agentMediaTooLargeError() *applicationError {
+	return apiError(http.StatusRequestEntityTooLarge, "agent_media_too_large", "The image exceeds the 25 MiB upload limit", false, "Choose an image no larger than 25 MiB.")
+}
+
+func (h *Handler) writeAgentMediaError(w http.ResponseWriter, requestID, stage string, err error) {
+	mapped := mapError(err)
+	h.logger.Warn("Agent image upload failed", "request_id", requestID, "stage", stage,
+		"error_code", mapped.Code, "error_summary", safeDiagnosticError(err))
+	h.writeError(w, requestID, mapped)
 }
 
 func (h *Handler) interruptTurn(w http.ResponseWriter, r *http.Request, requestID, rawSessionID, rawTurnID string) {

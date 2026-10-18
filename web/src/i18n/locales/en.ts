@@ -1160,6 +1160,18 @@ const en = {
     newSession: 'New session',
     recentSessions: 'Recent sessions',
     sessionMenu: 'Switch Agent session',
+    compactContext: 'Organize context',
+    compactContextHint:
+      'Use the Agent to summarize working context; this may use credits. Messages and original attachments are kept. Reference images again when fine details matter.',
+    contextCompacting: 'Organizing context… You can edit your draft and send after this finishes.',
+    contextCompacted: 'Context organized. You can continue the conversation.',
+    contextCompactionUnavailable:
+      'This Agent runtime does not support organizing context. Update the runtime or start a new session.',
+    contextCompactionBusy: 'This session is busy. Wait for its current work to finish, then try again.',
+    contextCompactionTimeout:
+      'Organizing context has not finished yet. Wait for the session status to update before trying again.',
+    contextCompactionFailed:
+      'Could not organize context. Your draft and attachments are kept. Try again when the session is available.',
     resize: 'Resize Agent panel',
     sessionCount: '{{count}} sessions',
     available: 'Available',

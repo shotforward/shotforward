@@ -1,11 +1,12 @@
-import { useEffect, useState } from 'react';
+import { useEffect, useRef, useState } from 'react';
 import { useQueryClient } from '@tanstack/react-query';
-import type { AgentEvent } from './agent';
+import type { AgentEvent, AgentTurn } from './agent';
 
 const eventTypes = [
   'turn.queued',
   'turn.started',
   'turn.waiting_user',
+  'turn.retrying',
   'assistant.delta',
   'tool.started',
   'tool.completed',
@@ -16,30 +17,84 @@ const eventTypes = [
   'session.resync_required',
 ];
 
-export function useAgentEvents(sessionID: string | undefined, cursor: string | undefined) {
+type EventTurn = Pick<AgentTurn, 'id' | 'status'>;
+
+export function useAgentEvents(
+  sessionID: string | undefined,
+  cursor: string | undefined,
+  // null is an authoritative idle snapshot; undefined means not loaded yet.
+  currentTurn?: EventTurn | null,
+) {
   const queryClient = useQueryClient();
   const [assistant, setAssistant] = useState({ turnID: '', text: '' });
-  const [activity, setActivity] = useState('');
+  const [activity, setActivity] = useState<{ sessionID: string; turnID: string; name: string }>();
+  const [retrying, setRetrying] = useState<{ sessionID: string; turnID: string }>();
   const [toolFailure, setToolFailure] = useState<{ sessionID: string; code: string }>();
   const [connected, setConnected] = useState(false);
   const streamKey = sessionID && cursor ? sessionID : undefined;
+  const view = useRef({ sessionID, currentTurn });
+  view.current = { sessionID, currentTurn };
+  const eventTurn = useRef<{ sessionID: string; turnID: string } | undefined>(undefined);
+  const terminalTurns = useRef({ sessionID, ids: new Set<string>() });
+  if (terminalTurns.current.sessionID !== sessionID) {
+    terminalTurns.current = { sessionID, ids: new Set<string>() };
+    eventTurn.current = undefined;
+  }
+
+  function isCurrentTurn(turnID: string | undefined) {
+    const { sessionID: currentSessionID, currentTurn: authority } = view.current;
+    if (!turnID || authority === null || terminalTurns.current.ids.has(turnID)) return false;
+    if (authority) {
+      return (
+        authority.id === turnID &&
+        !['succeeded', 'completed', 'failed', 'interrupted'].includes(authority.status)
+      );
+    }
+    const fallback = eventTurn.current;
+    return Boolean(fallback && fallback.sessionID === currentSessionID && fallback.turnID === turnID);
+  }
 
   useEffect(() => {
     setAssistant({ turnID: '', text: '' });
-    setActivity('');
+    setActivity(undefined);
+    setRetrying(undefined);
     if (!streamKey || !cursor) return;
     const source = new EventSource(
       `/api/v1/agent-sessions/${encodeURIComponent(streamKey)}/events?after=${encodeURIComponent(cursor)}`,
     );
-    source.onopen = () => setConnected(true);
-    source.onerror = () => setConnected(false);
+    let active = true;
+    source.onopen = () => {
+      if (active && view.current.sessionID === streamKey) setConnected(true);
+    };
+    source.onerror = () => {
+      if (active && view.current.sessionID === streamKey) setConnected(false);
+    };
     const receive = (raw: Event) => {
+      if (!active || view.current.sessionID !== streamKey) return;
       let event: AgentEvent;
       try {
         event = JSON.parse((raw as MessageEvent<string>).data) as AgentEvent;
       } catch {
         void queryClient.invalidateQueries({ queryKey: ['agent-session', streamKey] });
         return;
+      }
+      if (event.session_id !== streamKey) return;
+      const authority = view.current.currentTurn;
+      if (event.type === 'turn.started' && event.turn_id && authority === undefined) {
+        eventTurn.current = { sessionID: streamKey, turnID: event.turn_id };
+      }
+      const matchesCurrentTurn = isCurrentTurn(event.turn_id);
+      if (event.type === 'turn.retrying' && matchesCurrentTurn) {
+        setRetrying({ sessionID: streamKey, turnID: event.turn_id! });
+        setActivity(undefined);
+      }
+      if (
+        matchesCurrentTurn &&
+        (event.type === 'turn.started' ||
+          (event.type === 'assistant.delta' && event.text_delta) ||
+          ((event.type === 'tool.started' || event.type === 'tool.completed') && event.tool_name))
+      ) {
+        setRetrying(undefined);
       }
       if (event.type === 'assistant.delta' && event.text_delta)
         setAssistant((value) => ({
@@ -49,10 +104,19 @@ export function useAgentEvents(sessionID: string | undefined, cursor: string | u
               ? event.text_delta!
               : value.text + event.text_delta,
         }));
-      if (event.type === 'tool.started') setActivity(event.tool_name ?? '');
-      if (event.type === 'tool.completed') setActivity('');
-      if (event.type === 'turn.started') setToolFailure(undefined);
-      if (event.type === 'tool.completed' && event.failure_code)
+      if (event.type === 'tool.started' && matchesCurrentTurn)
+        setActivity({ sessionID: streamKey, turnID: event.turn_id!, name: event.tool_name ?? '' });
+      if (event.type === 'tool.completed' && matchesCurrentTurn) setActivity(undefined);
+      if (event.type === 'turn.started' && matchesCurrentTurn) {
+        setActivity(undefined);
+        setToolFailure(undefined);
+      }
+      if (event.type === 'turn.completed' && event.turn_id) {
+        terminalTurns.current.ids.add(event.turn_id);
+        setRetrying((value) => (value?.turnID === event.turn_id ? undefined : value));
+        setActivity((value) => (value?.turnID === event.turn_id ? undefined : value));
+      }
+      if (event.type === 'tool.completed' && matchesCurrentTurn && event.failure_code)
         setToolFailure({ sessionID: streamKey, code: event.failure_code });
       if (
         event.type === 'turn.queued' ||
@@ -77,6 +141,7 @@ export function useAgentEvents(sessionID: string | undefined, cursor: string | u
     };
     eventTypes.forEach((type) => source.addEventListener(type, receive));
     return () => {
+      active = false;
       eventTypes.forEach((type) => source.removeEventListener(type, receive));
       source.close();
       setConnected(false);
@@ -86,7 +151,12 @@ export function useAgentEvents(sessionID: string | undefined, cursor: string | u
   return {
     assistantText: assistant.text,
     assistantTurnID: assistant.turnID,
-    activity,
+    activity:
+      activity && activity.sessionID === sessionID && isCurrentTurn(activity.turnID) ? activity.name : '',
+    retryingTurnID:
+      retrying && retrying.sessionID === sessionID && isCurrentTurn(retrying.turnID)
+        ? retrying.turnID
+        : undefined,
     toolFailureCode: toolFailure?.sessionID === sessionID ? toolFailure?.code : undefined,
     connected,
     clearAssistantText: () => setAssistant({ turnID: '', text: '' }),

@@ -17,6 +17,7 @@ type StudioEventType string
 const (
 	EventTurnQueued            StudioEventType = "turn.queued"
 	EventTurnStarted           StudioEventType = "turn.started"
+	EventTurnRetrying          StudioEventType = "turn.retrying"
 	EventTurnWaitingUser       StudioEventType = "turn.waiting_user"
 	EventAssistantDelta        StudioEventType = "assistant.delta"
 	EventToolStarted           StudioEventType = "tool.started"
@@ -58,6 +59,11 @@ func (e StudioEvent) Validate() error {
 		if e.TurnID == "" {
 			return ErrInvalidRuntimeValue
 		}
+	case EventTurnRetrying:
+		if e.TurnID == "" || e.FailureCode != RuntimeRetryingFailureCode || e.TurnStatus != "" ||
+			e.Summary != "" || e.TextDelta != "" || e.ToolName != "" || e.ChangeSetID != "" {
+			return ErrInvalidRuntimeValue
+		}
 	case EventAssistantDelta:
 		if e.TurnID == "" || e.TextDelta == "" {
 			return ErrInvalidRuntimeValue
@@ -96,7 +102,7 @@ func (DiscardEvents) Publish(StudioEvent) {}
 
 func validStudioEventType(value StudioEventType) bool {
 	switch value {
-	case EventTurnQueued, EventTurnStarted, EventTurnWaitingUser, EventAssistantDelta,
+	case EventTurnQueued, EventTurnStarted, EventTurnRetrying, EventTurnWaitingUser, EventAssistantDelta,
 		EventToolStarted, EventToolCompleted, EventChangeSetPending, EventChangeSetApplied, EventTurnCompleted,
 		EventRuntimeError, EventSessionResyncRequired:
 		return true

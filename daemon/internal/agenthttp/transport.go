@@ -107,6 +107,10 @@ func mapError(err error) *applicationError {
 		return direct
 	}
 	switch {
+	case errors.Is(err, agentapp.ErrContextCompactionUnavailable):
+		return apiError(http.StatusNotImplemented, "context_compaction_unavailable", "Agent context compaction is unavailable", false, "Use a Runtime that supports native context compaction.")
+	case errors.Is(err, agentapp.ErrContextCompactionBusy):
+		return apiError(http.StatusConflict, "context_compaction_busy", "Agent Session is busy with a Turn or context compaction", true, "Wait for the current operation to finish.")
 	case errors.Is(err, agentapp.ErrRuntimeSwitchBlocked):
 		return apiError(http.StatusConflict, "runtime_switch_blocked", "Agent Runtime cannot be switched while a Turn is active", false, "Wait for the active Turn to finish or interrupt it first.")
 	case errors.Is(err, ErrNotFound), errors.Is(err, agentsession.ErrSessionNotFound), errors.Is(err, changesetapp.ErrChangeSetNotFound), errors.Is(err, projectapp.ErrProjectStoreNotOpen), errors.Is(err, projectapp.ErrEpisodeNotFound):
@@ -123,6 +127,14 @@ func mapError(err error) *applicationError {
 		return apiError(http.StatusConflict, "change_set_precondition_failed", "the project changed and the ChangeSet precondition no longer holds", false, "Refresh the current project state before retrying or preparing a new change.")
 	case errors.Is(err, ErrInvalidState), errors.Is(err, agentsession.ErrSessionHasActiveTurn), errors.Is(err, changesetapp.ErrChangeSetStateConflict), errors.Is(err, agentscheduler.ErrSessionNotActive), errors.Is(err, agentscheduler.ErrTurnNotActive), errors.Is(err, agent.ErrSessionNotActive):
 		return apiError(http.StatusConflict, "invalid_state", "the operation is not allowed in the current state", false, "Refresh the Agent Session.")
+	case errors.Is(err, projectapp.ErrMediaImportUnsupported):
+		return apiError(http.StatusUnsupportedMediaType, "unsupported_media_type", "image format is not supported", false, "Choose a PNG, JPEG, or WebP image.")
+	case errors.Is(err, projectapp.ErrMediaImportInvalid):
+		return apiError(http.StatusUnprocessableEntity, "invalid_media", "image file is invalid", false, "Choose a complete, readable PNG, JPEG, or WebP image.")
+	case errors.Is(err, projectapp.ErrMediaImportUnreadable):
+		return apiError(http.StatusUnprocessableEntity, "unreadable_media", "image file could not be read", true, "Check local file access and retry the upload.")
+	case errors.Is(err, projectapp.ErrMediaImportUnavailable):
+		return apiError(http.StatusServiceUnavailable, "media_import_unavailable", "image import is unavailable", true, "Check local storage and media tools, then retry the upload.")
 	case errors.Is(err, changesetapp.ErrInvalidRequest), errors.Is(err, agentsession.ErrInvalidRequest), errors.Is(err, agentsession.ErrModelUnavailable), errors.Is(err, projectapp.ErrInvalidRequest),
 		errors.Is(err, agentscheduler.ErrInvalidAgentInput), errors.Is(err, agent.ErrInvalidSessionID),
 		errors.Is(err, agent.ErrInvalidTurnID), errors.Is(err, changeset.ErrInvalidChangeSetID), errors.Is(err, agentapp.ErrInvalidRuntimeNetworkSettings), errors.Is(err, agentapp.ErrInvalidRuntimeSelection):
@@ -133,6 +145,17 @@ func mapError(err error) *applicationError {
 		return apiError(http.StatusRequestTimeout, "interrupted", "request was interrupted", true, "Retry the request.")
 	default:
 		return apiError(http.StatusInternalServerError, "external_failure", "the operation could not be completed", true, "Retry or inspect the local diagnostics.")
+	}
+}
+
+func mapContextCompactionError(err error) *applicationError {
+	switch {
+	case errors.Is(err, agentapp.ErrContextCompactionUnavailable), errors.Is(err, agentapp.ErrContextCompactionBusy), errors.Is(err, agentscheduler.ErrSessionNotActive), errors.Is(err, agentscheduler.ErrInvalidAgentInput):
+		return mapError(err)
+	case errors.Is(err, context.Canceled), errors.Is(err, context.DeadlineExceeded):
+		return apiError(http.StatusGatewayTimeout, "context_compaction_timeout", "Stopped waiting for Agent context compaction", true, "Refresh the Session before retrying; the Runtime may still be finishing the operation.")
+	default:
+		return apiError(http.StatusBadGateway, "context_compaction_failed", "Agent context compaction could not be completed", true, "Retry or inspect the local diagnostics.")
 	}
 }
 

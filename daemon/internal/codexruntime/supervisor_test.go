@@ -203,7 +203,7 @@ func TestSupervisorLifecycleAndRuntimeMapping(t *testing.T) {
 	if err != nil || len(read.Turns) != 3 || read.Turns[0].Status != agent.TurnRunning || read.Turns[1].Status != agent.TurnCompleted || read.Turns[2].Status != agent.TurnInterrupted {
 		t.Fatalf("ReadThread() = %#v, %v", read, err)
 	}
-	conversation, err := supervisor.ListConversation(context.Background(), "thr_1", "older", 20)
+	conversation, err := supervisor.ListConversation(context.Background(), "thr_1", "older", 2)
 	if err != nil || conversation.NextCursor != "oldest" || len(conversation.Turns) != 2 {
 		t.Fatalf("ListConversation() = %#v, %v", conversation, err)
 	}
@@ -540,15 +540,23 @@ func runtimeHandler(loginRequired bool) func(string, map[string]any) (any, error
 				"isError":           false,
 			}, nil
 		case "thread/turns/list":
-			if params["cursor"] != "older" || params["limit"] != 20 || params["sortDirection"] != "desc" || params["itemsView"] != "full" {
+			if params["itemsView"] == "notLoaded" {
+				return map[string]any{"data": []map[string]any{{"id": "running", "status": "inProgress"}, {"id": "completed", "status": "completed"}, {"id": "interrupted", "status": "interrupted"}}, "nextCursor": nil}, nil
+			}
+			if params["limit"] != 1 || params["sortDirection"] != "desc" || params["itemsView"] != "full" {
 				return nil, errors.New("unexpected conversation pagination")
+			}
+			if params["cursor"] == "older" {
+				return map[string]any{"data": []map[string]any{{"id": "conversation-2", "status": "inProgress", "items": []map[string]any{
+					{"id": "reasoning-2", "type": "reasoning", "summary": []string{"must stay private"}},
+					{"id": "agent-2", "type": "agentMessage", "text": "Working", "phase": "commentary"},
+				}}}, "nextCursor": "middle"}, nil
+			}
+			if params["cursor"] != "middle" {
+				return nil, errors.New("unexpected conversation cursor")
 			}
 			return map[string]any{
 				"data": []map[string]any{
-					{"id": "conversation-2", "status": "inProgress", "items": []map[string]any{
-						{"id": "reasoning-2", "type": "reasoning", "summary": []string{"must stay private"}},
-						{"id": "agent-2", "type": "agentMessage", "text": "Working", "phase": "commentary"},
-					}},
 					{"id": "conversation-1", "status": "completed", "items": []map[string]any{
 						{"id": "user-1", "type": "userMessage", "content": []map[string]any{{"type": "input_text", "text": "First question"}}},
 						{"id": "tool-1", "type": "mcpToolCall", "arguments": map[string]any{"secret": true}},

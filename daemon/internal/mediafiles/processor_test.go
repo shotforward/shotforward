@@ -176,12 +176,12 @@ func TestPrepareCentersGeneratedImageCrop(t *testing.T) {
 	}
 }
 
-func TestPrepareRejectsUnsupportedExtensionAndSymlink(t *testing.T) {
+func TestPrepareRejectsUnsupportedImageContentAndSymlink(t *testing.T) {
 	t.Parallel()
 	processor := testProcessor(t)
 	root := t.TempDir()
 	source := filepath.Join(t.TempDir(), "image.gif")
-	writePNG(t, source, 10, 10)
+	writeTestGIF(t, source)
 	if _, err := processor.Prepare(context.Background(), projectapp.PrepareMediaRequest{ProjectRoot: root, SourcePath: source, Kind: domain.MediaKindImage}); !errors.Is(err, projectapp.ErrMediaImportUnsupported) {
 		t.Fatalf("unsupported error = %v", err)
 	}
@@ -194,14 +194,18 @@ func TestPrepareRejectsUnsupportedExtensionAndSymlink(t *testing.T) {
 	}
 }
 
-func TestPrepareRejectsContentThatDoesNotMatchExtension(t *testing.T) {
+func TestPrepareAcceptsImageContentThatDoesNotMatchExtension(t *testing.T) {
 	t.Parallel()
 	processor := testProcessor(t)
 	source := filepath.Join(t.TempDir(), "disguised.jpg")
 	writePNG(t, source, 10, 10)
-	_, err := processor.Prepare(context.Background(), projectapp.PrepareMediaRequest{ProjectRoot: t.TempDir(), SourcePath: source, Kind: domain.MediaKindImage})
-	if !errors.Is(err, projectapp.ErrMediaImportInvalid) {
-		t.Fatalf("mismatched content error = %v", err)
+	root := t.TempDir()
+	prepared, err := processor.Prepare(context.Background(), projectapp.PrepareMediaRequest{ProjectRoot: root, SourcePath: source, Kind: domain.MediaKindImage})
+	if err != nil || prepared.Extension != ".png" || prepared.MIMEType != "image/png" || prepared.OriginalFilename != "disguised.jpg" {
+		t.Fatalf("mismatched image content = %#v, %v", prepared, err)
+	}
+	if err := processor.Discard(root, prepared); err != nil {
+		t.Fatal(err)
 	}
 }
 

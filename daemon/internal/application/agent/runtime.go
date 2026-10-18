@@ -234,6 +234,7 @@ type RuntimeEventType string
 
 const (
 	RuntimeTurnStarted       RuntimeEventType = "turn_started"
+	RuntimeTurnRetrying      RuntimeEventType = "turn_retrying"
 	RuntimeAssistantDelta    RuntimeEventType = "assistant_delta"
 	RuntimeToolStarted       RuntimeEventType = "tool_started"
 	RuntimeToolCompleted     RuntimeEventType = "tool_completed"
@@ -242,6 +243,10 @@ const (
 	RuntimeTurnCompleted     RuntimeEventType = "turn_completed"
 	RuntimeConnectionFailure RuntimeEventType = "connection_failure"
 )
+
+// RuntimeRetryingFailureCode is a safe, non-terminal notification code. Native
+// error messages and provider/account details must not enter the retry stream.
+const RuntimeRetryingFailureCode = "runtime_retrying"
 
 type RuntimeEvent struct {
 	Type               RuntimeEventType

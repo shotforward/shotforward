@@ -318,6 +318,22 @@ func (r *Router) InterruptTurn(ctx context.Context, threadID, turnID string) err
 	kind, raw := parse(threadID)
 	return r.runtime(kind).InterruptTurn(ctx, raw, turnID)
 }
+func (r *Router) CompactThread(ctx context.Context, threadID string) error {
+	kind, raw := parse(threadID)
+	if err := r.ensureActive(ctx, kind); err != nil {
+		return err
+	}
+	runtime, ok := r.runtime(kind).(agentapp.ContextCompactingRuntime)
+	if !ok {
+		return agentapp.ErrContextCompactionUnavailable
+	}
+	return runtime.CompactThread(ctx, raw)
+}
+func (r *Router) ContextCompactionInProgress(threadID string) bool {
+	kind, raw := parse(threadID)
+	runtime, ok := r.runtime(kind).(agentapp.ContextCompactionStatusRuntime)
+	return ok && runtime.ContextCompactionInProgress(raw)
+}
 func (r *Router) Subscribe(ctx context.Context, threadID string) (<-chan agentapp.RuntimeEvent, error) {
 	kind, raw := parse(threadID)
 	if err := r.ensureActive(ctx, kind); err != nil {

@@ -116,11 +116,12 @@ type TurnScheduler struct {
 	pollInterval time.Duration
 	wake         chan struct{}
 
-	mutex     sync.Mutex
-	recovered bool
-	queued    map[agent.TurnID]queuedInput
-	active    map[agent.TurnID]struct{}
-	waitGroup sync.WaitGroup
+	mutex      sync.Mutex
+	recovered  bool
+	queued     map[agent.TurnID]queuedInput
+	active     map[agent.TurnID]struct{}
+	compacting map[agent.SessionID]struct{}
+	waitGroup  sync.WaitGroup
 }
 
 func NewTurnScheduler(options SchedulerOptions) (*TurnScheduler, error) {
@@ -135,7 +136,7 @@ func NewTurnScheduler(options SchedulerOptions) (*TurnScheduler, error) {
 	}
 	return &TurnScheduler{
 		store: options.Store, runtime: options.Runtime, mcp: options.MCP, ids: options.IDs, clock: options.Clock,
-		events: options.Events, media: options.Media, pollInterval: options.PollInterval, wake: make(chan struct{}, 1), queued: make(map[agent.TurnID]queuedInput), active: make(map[agent.TurnID]struct{}),
+		events: options.Events, media: options.Media, pollInterval: options.PollInterval, wake: make(chan struct{}, 1), queued: make(map[agent.TurnID]queuedInput), active: make(map[agent.TurnID]struct{}), compacting: make(map[agent.SessionID]struct{}),
 	}, nil
 }
 
@@ -161,6 +162,15 @@ func (s *TurnScheduler) SubmitInput(ctx context.Context, input SubmitInput) (Sub
 	fingerprint := inputFingerprint(input)
 
 	s.mutex.Lock()
+	compacting, compactionErr := s.contextCompactingLocked(ctx, input.AgentSessionID)
+	if compactionErr != nil {
+		s.mutex.Unlock()
+		return SubmitResult{}, compactionErr
+	}
+	if compacting {
+		s.mutex.Unlock()
+		return SubmitResult{}, agentapp.ErrContextCompactionBusy
+	}
 	operation, created, err := s.store.AdmitAgentInput(ctx, candidate, fingerprint, input.Text, agentapp.SessionTitleFromText(input.Text))
 	if err != nil {
 		s.mutex.Unlock()
@@ -207,6 +217,84 @@ func (s *TurnScheduler) SubmitInput(ctx context.Context, input SubmitInput) (Sub
 	}
 	s.Notify()
 	return result, nil
+}
+
+// CompactSession reserves an idle Session against new input admission. The
+// Runtime must wait for its native completion notification before returning nil;
+// a command acknowledgement alone does not finish this operation.
+func (s *TurnScheduler) CompactSession(ctx context.Context, sessionID agent.SessionID) error {
+	if ctx == nil || sessionID.Validate() != nil {
+		return ErrInvalidAgentInput
+	}
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	runtime, ok := s.runtime.(agentapp.ContextCompactingRuntime)
+	if !ok {
+		return agentapp.ErrContextCompactionUnavailable
+	}
+	s.mutex.Lock()
+	if _, exists := s.compacting[sessionID]; exists {
+		s.mutex.Unlock()
+		return agentapp.ErrContextCompactionBusy
+	}
+	session, err := s.store.AgentSession(ctx, sessionID)
+	if err != nil {
+		s.mutex.Unlock()
+		return err
+	}
+	if session.Status != agent.SessionActive {
+		s.mutex.Unlock()
+		return ErrSessionNotActive
+	}
+	if status, ok := s.runtime.(agentapp.ContextCompactionStatusRuntime); ok && status.ContextCompactionInProgress(session.CodexThreadID) {
+		s.mutex.Unlock()
+		return agentapp.ErrContextCompactionBusy
+	}
+	turns, err := s.store.AgentTurnsForRecovery(ctx, maximumRecoveryTurns)
+	if err != nil {
+		s.mutex.Unlock()
+		return fmt.Errorf("compact Agent Session: read pending Turns: %w", err)
+	}
+	for _, turn := range turns {
+		if turn.AgentSessionID == sessionID && !turn.Status.IsTerminal() {
+			s.mutex.Unlock()
+			return agentapp.ErrContextCompactionBusy
+		}
+	}
+	s.compacting[sessionID] = struct{}{}
+	s.mutex.Unlock()
+	defer func() {
+		s.mutex.Lock()
+		delete(s.compacting, sessionID)
+		s.mutex.Unlock()
+	}()
+	return runtime.CompactThread(ctx, session.CodexThreadID)
+}
+
+func (s *TurnScheduler) IsContextCompacting(sessionID agent.SessionID) bool {
+	s.mutex.Lock()
+	defer s.mutex.Unlock()
+	compacting, _ := s.contextCompactingLocked(context.Background(), sessionID)
+	return compacting
+}
+
+// The native operation can outlive an HTTP wait that was cancelled. Keep input
+// admission closed until the Runtime releases that Thread, without persisting a
+// fake Turn or keeping the cancelled request's scheduler reservation alive.
+func (s *TurnScheduler) contextCompactingLocked(ctx context.Context, sessionID agent.SessionID) (bool, error) {
+	if _, compacting := s.compacting[sessionID]; compacting {
+		return true, nil
+	}
+	status, ok := s.runtime.(agentapp.ContextCompactionStatusRuntime)
+	if !ok {
+		return false, nil
+	}
+	session, err := s.store.AgentSession(ctx, sessionID)
+	if err != nil {
+		return false, err
+	}
+	return status.ContextCompactionInProgress(session.CodexThreadID), nil
 }
 
 func (s *TurnScheduler) InterruptTurn(ctx context.Context, sessionID agent.SessionID, turnID agent.TurnID) (agent.AgentTurn, error) {
@@ -441,6 +529,13 @@ func (s *TurnScheduler) process(ctx context.Context, turn agent.AgentTurn) error
 				continue
 			}
 			switch event.Type {
+			case agentapp.RuntimeTurnRetrying:
+				// Retry progress must identify this exact native Turn. It does not
+				// change durable status, release the MCP binding, or resend work.
+				if event.CodexTurnID != turn.CodexTurnID {
+					continue
+				}
+				s.publish(agentapp.StudioEvent{Type: agentapp.EventTurnRetrying, SessionID: turn.AgentSessionID, TurnID: turn.ID, FailureCode: agentapp.RuntimeRetryingFailureCode, OccurredAt: s.eventTime(event.OccurredAt)})
 			case agentapp.RuntimeWaitingUser:
 				turn, err = s.changeActiveState(ctx, turn, agent.TurnWaitingUser)
 				if err != nil {
