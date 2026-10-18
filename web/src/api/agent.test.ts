@@ -1,5 +1,5 @@
 import { beforeEach, describe, expect, it, vi } from 'vitest';
-import { startAgentWorkflow, submitAgentInput } from './agent';
+import { compactSessionContext, startAgentWorkflow, submitAgentInput } from './agent';
 
 const mocks = vi.hoisted(() => ({
   requestJSON: vi.fn(),
@@ -28,6 +28,17 @@ describe('startAgentWorkflow', () => {
   beforeEach(() => {
     vi.clearAllMocks();
     window.localStorage.clear();
+  });
+
+  it('requests context compaction for exactly the selected session without a data envelope', async () => {
+    mocks.requestJSON.mockResolvedValue({ context_compacted: true });
+
+    await expect(compactSessionContext('session/with space')).resolves.toEqual({ context_compacted: true });
+
+    expect(mocks.requestJSON).toHaveBeenCalledExactlyOnceWith(
+      '/api/v1/agent-sessions/session%2Fwith%20space/compact',
+      { method: 'POST', body: '{}' },
+    );
   });
 
   it('sends trusted model context separately from the user text for ordinary requests', async () => {

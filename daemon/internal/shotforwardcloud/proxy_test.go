@@ -1,7 +1,13 @@
 package shotforwardcloud
 
 import (
+	"bytes"
+	"compress/gzip"
+	"crypto/sha256"
+	"encoding/json"
+	"errors"
 	"io"
+	"log/slog"
 	"net/http"
 	"net/http/httptest"
 	"reflect"
@@ -128,4 +134,286 @@ func TestProxyOpenAIPreservesSessionMetadata(t *testing.T) {
 	if calls != 2 {
 		t.Fatalf("upstream requests=%d, want 2", calls)
 	}
+}
+
+func TestProxyOpenAIPreservesLargeImageHistory(t *testing.T) {
+	body, err := json.Marshal(map[string]any{
+		"model": "test-model",
+		"input": []any{
+			map[string]any{"role": "user", "content": []any{
+				map[string]any{"type": "input_text", "text": "Inspect this image"},
+				map[string]any{"type": "input_image", "image_url": "data:image/png;base64," + strings.Repeat("a", 5<<20)},
+			}},
+			map[string]any{"role": "assistant", "content": "The first image is visible."},
+			map[string]any{"role": "user", "content": []any{
+				map[string]any{"type": "input_text", "text": "Compare this image"},
+				map[string]any{"type": "input_image", "image_url": "data:image/png;base64," + strings.Repeat("b", 4<<20)},
+			}},
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(body) <= 8<<20 {
+		t.Fatal("fixture does not cross the former proxy limit")
+	}
+	calls := 0
+	manager := proxyTestManager(t, func(r *http.Request) (*http.Response, error) {
+		calls++
+		got, err := io.ReadAll(r.Body)
+		if err != nil || !bytes.Equal(got, body) || !json.Valid(got) {
+			t.Error("large multi-image history was changed or truncated")
+		}
+		if r.ContentLength != int64(len(body)) {
+			t.Errorf("upstream Content-Length=%d, want %d", r.ContentLength, len(body))
+		}
+		return proxyTestResponse(http.StatusOK, `{}`), nil
+	})
+	r := httptest.NewRequest(http.MethodPost, "/api/v1/cloud/openai/responses", bytes.NewReader(body))
+	// Chunked uploads must receive the same protection as known-length uploads.
+	r.ContentLength = -1
+	w := httptest.NewRecorder()
+	manager.ProxyOpenAI(w, r, "/responses")
+	if w.Code != http.StatusOK || calls != 1 {
+		t.Fatalf("status=%d upstream calls=%d", w.Code, calls)
+	}
+}
+
+func TestProxyOpenAIRequestBodyBoundary(t *testing.T) {
+	const limit = 64 << 20
+	for _, step := range []struct {
+		name          string
+		size          int64
+		unknownLength bool
+		wantStatus    int
+	}{
+		{"exact limit", limit, false, http.StatusOK},
+		{"limit plus one", limit + 1, false, http.StatusRequestEntityTooLarge},
+		{"unknown length limit plus one", limit + 1, true, http.StatusRequestEntityTooLarge},
+	} {
+		t.Run(step.name, func(t *testing.T) {
+			calls := 0
+			wantDigest := sha256.New()
+			_, _ = io.Copy(wantDigest, proxyJSONBody(step.size))
+			manager := proxyTestManager(t, func(r *http.Request) (*http.Response, error) {
+				calls++
+				gotDigest := sha256.New()
+				size, err := io.Copy(gotDigest, r.Body)
+				if err != nil || size != step.size || !bytes.Equal(gotDigest.Sum(nil), wantDigest.Sum(nil)) {
+					t.Error("boundary-sized body was changed or truncated")
+				}
+				if r.ContentLength != step.size {
+					t.Errorf("Content-Length=%d, want %d", r.ContentLength, step.size)
+				}
+				return proxyTestResponse(http.StatusOK, `{}`), nil
+			})
+			r := httptest.NewRequest(http.MethodPost, "/api/v1/cloud/openai/responses", proxyJSONBody(step.size))
+			r.ContentLength = step.size
+			if step.unknownLength {
+				r.ContentLength = -1
+			}
+			w := httptest.NewRecorder()
+			manager.ProxyOpenAI(w, r, "/responses")
+			if w.Code != step.wantStatus {
+				t.Fatalf("status=%d, want %d", w.Code, step.wantStatus)
+			}
+			if step.wantStatus == http.StatusOK {
+				if calls != 1 {
+					t.Fatalf("upstream calls=%d, want 1", calls)
+				}
+				return
+			}
+			if calls != 0 {
+				t.Fatal("oversized request reached upstream")
+			}
+			var envelope struct {
+				Error struct {
+					Message string `json:"message"`
+					Type    string `json:"type"`
+					Param   any    `json:"param"`
+					Code    string `json:"code"`
+				} `json:"error"`
+			}
+			if json.Unmarshal(w.Body.Bytes(), &envelope) != nil || envelope.Error.Code != "request_too_large" || envelope.Error.Type != "invalid_request_error" || envelope.Error.Param != nil || !strings.Contains(envelope.Error.Message, "64 MiB") {
+				t.Fatal("oversized request did not return an actionable OpenAI error")
+			}
+			if !strings.HasPrefix(w.Header().Get("Content-Type"), "application/json") {
+				t.Fatal("oversized request did not return JSON content type")
+			}
+		})
+	}
+}
+
+func TestProxyOpenAIRejectsRequestReadErrors(t *testing.T) {
+	calls := 0
+	manager := proxyTestManager(t, func(*http.Request) (*http.Response, error) {
+		calls++
+		return proxyTestResponse(http.StatusOK, `{}`), nil
+	})
+	r := httptest.NewRequest(http.MethodPost, "/api/v1/cloud/openai/responses", io.MultiReader(strings.NewReader(`{"input":"partial`), proxyErrorReader{}))
+	w := httptest.NewRecorder()
+	manager.ProxyOpenAI(w, r, "/responses")
+	if w.Code != http.StatusBadGateway || calls != 0 || !json.Valid(w.Body.Bytes()) {
+		t.Fatalf("read failure status=%d upstream calls=%d", w.Code, calls)
+	}
+}
+
+func TestProxyOpenAIPreservesEncodedRequestBodies(t *testing.T) {
+	var compressed bytes.Buffer
+	zipper := gzip.NewWriter(&compressed)
+	if _, err := zipper.Write([]byte(`{"input":"compressed image history"}`)); err != nil {
+		t.Fatal(err)
+	}
+	if err := zipper.Close(); err != nil {
+		t.Fatal(err)
+	}
+	for _, step := range []struct {
+		encoding string
+		body     []byte
+	}{
+		{"gzip", compressed.Bytes()},
+		// The proxy must also preserve encodings it cannot decode itself.
+		{"zstd", []byte{0x28, 0xb5, 0x2f, 0xfd, 0x20, 0x00, 0x01, 0x00, 0x00}},
+	} {
+		t.Run(step.encoding, func(t *testing.T) {
+			calls := 0
+			manager := proxyTestManager(t, func(r *http.Request) (*http.Response, error) {
+				calls++
+				got, err := io.ReadAll(r.Body)
+				if err != nil || !bytes.Equal(got, step.body) || r.Header.Get("Content-Encoding") != step.encoding {
+					t.Error("encoded request bytes or encoding header were changed")
+				}
+				if r.Header.Get("Content-Type") != "application/json" || r.ContentLength != int64(len(step.body)) {
+					t.Error("encoded request metadata was changed")
+				}
+				return proxyTestResponse(http.StatusOK, `{}`), nil
+			})
+			r := httptest.NewRequest(http.MethodPost, "/api/v1/cloud/openai/responses", bytes.NewReader(step.body))
+			r.Header.Set("Content-Encoding", step.encoding)
+			r.Header.Set("Content-Type", "application/json")
+			w := httptest.NewRecorder()
+			manager.ProxyOpenAI(w, r, "/responses")
+			if w.Code != http.StatusOK || calls != 1 {
+				t.Fatalf("status=%d upstream calls=%d", w.Code, calls)
+			}
+		})
+	}
+}
+
+func TestProxyOpenAICompactRouteIsExplicit(t *testing.T) {
+	calls := 0
+	const body = `{"model":"test-model","input":[{"role":"user","content":"summarize history"}]}`
+	manager := proxyTestManager(t, func(r *http.Request) (*http.Response, error) {
+		calls++
+		if r.Method != http.MethodPost || r.URL.Path != "/v1/responses/compact" {
+			t.Error("unexpected compact upstream method or path")
+		}
+		got, err := io.ReadAll(r.Body)
+		if err != nil || string(got) != body {
+			t.Error("compact body was changed")
+		}
+		if r.Header.Get("Authorization") != "Bearer cloud-test-token" || r.Header.Get("Cookie") != "" || r.Header.Get("ChatGPT-Account-ID") != "" {
+			t.Error("compact request crossed the credential boundary")
+		}
+		return proxyTestResponse(http.StatusOK, `{"object":"response.compaction","output":[]}`), nil
+	})
+	handler, err := NewHandler(manager, slog.New(slog.NewTextHandler(io.Discard, nil)))
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, step := range []struct {
+		method, suffix string
+		wantStatus     int
+	}{
+		{http.MethodPost, "/responses/compact", http.StatusOK},
+		{http.MethodGet, "/responses/compact", http.StatusMethodNotAllowed},
+		{http.MethodPut, "/responses/compact", http.StatusMethodNotAllowed},
+		{http.MethodPost, "/responses/compact/", http.StatusNotFound},
+		{http.MethodPost, "/responses/compact/other", http.StatusNotFound},
+		{http.MethodPost, "/responses/compact-other", http.StatusNotFound},
+		{http.MethodPost, "/other", http.StatusNotFound},
+	} {
+		t.Run(step.method+" "+step.suffix, func(t *testing.T) {
+			before := calls
+			r := httptest.NewRequest(step.method, "/api/v1/cloud/openai"+step.suffix, strings.NewReader(body))
+			r.Header.Set("Authorization", "Bearer local-test-capability")
+			r.Header.Set("Cookie", "local=test")
+			r.Header.Set("ChatGPT-Account-ID", "untrusted-local-account")
+			w := httptest.NewRecorder()
+			handler.ServeHTTP(w, r)
+			if w.Code != step.wantStatus {
+				t.Fatalf("status=%d, want %d", w.Code, step.wantStatus)
+			}
+			wantCalls := before
+			if step.wantStatus == http.StatusOK {
+				wantCalls++
+			}
+			if calls != wantCalls {
+				t.Fatal("unapproved route was forwarded or request was retried")
+			}
+			if step.wantStatus == http.StatusMethodNotAllowed && w.Header().Get("Allow") != http.MethodPost {
+				t.Fatal("compact method rejection did not advertise POST")
+			}
+		})
+	}
+}
+
+func TestProxyOpenAIPreservesUpstreamErrorsWithoutRetry(t *testing.T) {
+	for _, suffix := range []string{"/responses", "/responses/compact"} {
+		for _, status := range []int{http.StatusBadRequest, http.StatusRequestEntityTooLarge, http.StatusTooManyRequests, http.StatusInternalServerError} {
+			t.Run(suffix+" "+http.StatusText(status), func(t *testing.T) {
+				calls := 0
+				const body = `{"error":{"message":"upstream rejected request","type":"invalid_request_error","param":null,"code":"upstream_error"}}`
+				manager := proxyTestManager(t, func(*http.Request) (*http.Response, error) {
+					calls++
+					response := proxyTestResponse(status, body)
+					response.Header.Set("X-Request-ID", "req_synthetic")
+					return response, nil
+				})
+				r := httptest.NewRequest(http.MethodPost, "/api/v1/cloud/openai"+suffix, strings.NewReader(`{"input":"hello"}`))
+				w := httptest.NewRecorder()
+				manager.ProxyOpenAI(w, r, suffix)
+				if w.Code != status || w.Body.String() != body || w.Header().Get("X-Request-ID") != "req_synthetic" || calls != 1 {
+					t.Fatalf("upstream error changed: status=%d calls=%d", w.Code, calls)
+				}
+			})
+		}
+	}
+}
+
+func proxyTestManager(t *testing.T, transport roundTripFunc) *Manager {
+	t.Helper()
+	manager, err := NewManager("https://cloud.example", &memoryCredentials{}, &http.Client{Transport: transport})
+	if err != nil {
+		t.Fatal(err)
+	}
+	manager.accessToken = "cloud-test-token"
+	manager.expiresAt = time.Now().Add(time.Hour)
+	return manager
+}
+
+func proxyTestResponse(status int, body string) *http.Response {
+	return &http.Response{StatusCode: status, Header: http.Header{"Content-Type": {"application/json"}}, Body: io.NopCloser(strings.NewReader(body))}
+}
+
+// Generate valid large JSON without holding another entire boundary-sized body
+// in memory alongside the proxy's bounded request buffer.
+func proxyJSONBody(size int64) io.Reader {
+	const prefix, suffix = `{"input":"`, `"}`
+	return io.MultiReader(strings.NewReader(prefix), io.LimitReader(proxyPaddingReader{}, size-int64(len(prefix)+len(suffix))), strings.NewReader(suffix))
+}
+
+type proxyPaddingReader struct{}
+
+func (proxyPaddingReader) Read(buffer []byte) (int, error) {
+	for index := range buffer {
+		buffer[index] = 'a'
+	}
+	return len(buffer), nil
+}
+
+type proxyErrorReader struct{}
+
+func (proxyErrorReader) Read([]byte) (int, error) {
+	return 0, errors.New("synthetic request read failure")
 }

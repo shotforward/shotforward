@@ -27,6 +27,7 @@ export interface AgentTurn {
   status: string;
   failure?: { code: string; summary: string };
   created_at: string;
+  started_at?: string;
   completed_at?: string;
 }
 
@@ -122,6 +123,7 @@ export interface SessionSnapshot {
   turns: AgentTurn[];
   change_sets: ChangeSetSummary[];
   cursor: string;
+  context_compacting?: boolean;
 }
 
 export interface AgentConversationMessage {
@@ -161,8 +163,22 @@ export interface AgentConversationPage {
   next_cursor: string;
 }
 
+export type AgentEventType =
+  | 'turn.queued'
+  | 'turn.started'
+  | 'turn.waiting_user'
+  | 'turn.retrying'
+  | 'assistant.delta'
+  | 'tool.started'
+  | 'tool.completed'
+  | 'change_set.pending'
+  | 'change_set.applied'
+  | 'turn.completed'
+  | 'runtime.error'
+  | 'session.resync_required';
+
 export interface AgentEvent {
-  type: string;
+  type: AgentEventType;
   session_id: string;
   turn_id?: string;
   change_set_id?: string;
@@ -201,6 +217,13 @@ export function createSession(
 
 export function getSessionSnapshot(sessionID: string): Promise<SessionSnapshot> {
   return requestJSON(`/api/v1/agent-sessions/${encodeURIComponent(sessionID)}/snapshot`);
+}
+
+export function compactSessionContext(sessionID: string): Promise<{ context_compacted: true }> {
+  return requestJSON(`/api/v1/agent-sessions/${encodeURIComponent(sessionID)}/compact`, {
+    method: 'POST',
+    body: JSON.stringify({}),
+  });
 }
 
 export function getSessionMessages(

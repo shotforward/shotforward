@@ -87,6 +87,9 @@ type Supervisor struct {
 	subscribers       map[string]map[uint64]chan agentapp.RuntimeEvent
 	nextSubscriber    uint64
 	activeTurns       map[string]string
+	pendingTurns      map[string]*pendingTurnStart
+	compactions       map[string]*contextCompaction
+	compactedTurns    map[string]string
 	threadWorkspaces  map[string]string
 	networkSettings   agentapp.RuntimeNetworkSettings
 	baseEnvironment   []string
@@ -191,6 +194,8 @@ func newSupervisor(options Options, deps dependencies) (*Supervisor, error) {
 		snapshot:         agentapp.RuntimeSnapshot{Health: agentapp.RuntimeNotInstalled, FailureCode: "codex_not_installed", FailureSummary: "Codex Runtime has not been started"},
 		subscribers:      make(map[string]map[uint64]chan agentapp.RuntimeEvent),
 		activeTurns:      make(map[string]string),
+		pendingTurns:     make(map[string]*pendingTurnStart),
+		compactions:      make(map[string]*contextCompaction),
 		threadWorkspaces: make(map[string]string),
 		networkSettings:  networkSettings,
 		baseEnvironment:  baseEnvironment,
@@ -874,6 +879,9 @@ func (s *Supervisor) threadRequest(ctx context.Context, method, threadID string,
 		params["serviceName"] = "shotforward_agent"
 	} else {
 		params["threadId"] = threadID
+		// Resume native history in the Runtime, not in this JSONL response.
+		// Display and recovery load their bounded pages independently.
+		params["excludeTurns"] = true
 	}
 	config := map[string]any{"apps": map[string]any{"_default": map[string]any{"enabled": false}}}
 	if request.WebSearchDisabled {
@@ -1065,12 +1073,16 @@ func (s *Supervisor) ReadThread(ctx context.Context, threadID string) (agentapp.
 	var response struct {
 		Thread wireThread `json:"thread"`
 	}
-	if err := client.Request(ctx, "thread/read", map[string]any{"threadId": threadID, "includeTurns": true}, &response); err != nil {
+	if err := client.Request(ctx, "thread/read", map[string]any{"threadId": threadID, "includeTurns": false}, &response); err != nil {
 		return agentapp.Thread{}, err
 	}
 	mapped := mapThread(response.Thread, "")
 	if mapped.CodexThreadID == "" || mapped.CodexSessionID == "" {
 		return agentapp.Thread{}, errors.New("thread/read returned an incomplete Thread")
+	}
+	mapped.Turns, err = readTurnStatuses(ctx, client, threadID)
+	if err != nil {
+		return agentapp.Thread{}, err
 	}
 	return mapped, nil
 }
@@ -1083,31 +1095,16 @@ func (s *Supervisor) ListConversation(ctx context.Context, threadID, cursor stri
 	if strings.TrimSpace(threadID) == "" || len(cursor) > maximumConversationCursorBytes || strings.ContainsRune(cursor, 0) || limit < 1 || limit > 50 {
 		return agentapp.RuntimeConversationPage{}, errors.New("Codex conversation request is invalid")
 	}
-	params := map[string]any{
-		"threadId": threadID, "limit": limit, "sortDirection": "desc", "itemsView": "full",
-	}
-	if cursor != "" {
-		params["cursor"] = cursor
-	}
-	var response struct {
-		Data       []wireConversationTurn `json:"data"`
-		NextCursor *string                `json:"nextCursor"`
-	}
-	if err := client.Request(ctx, "thread/turns/list", params, &response); err != nil {
+	values, nextCursor, err := readConversationTurns(ctx, client, threadID, cursor, limit)
+	if err != nil {
 		return agentapp.RuntimeConversationPage{}, err
 	}
-	result := agentapp.RuntimeConversationPage{Turns: make([]agentapp.RuntimeConversationTurn, 0, len(response.Data))}
-	if response.NextCursor != nil {
-		if len(*response.NextCursor) > maximumConversationCursorBytes || strings.ContainsRune(*response.NextCursor, 0) {
-			return agentapp.RuntimeConversationPage{}, errors.New("thread/turns/list returned an invalid cursor")
-		}
-		result.NextCursor = *response.NextCursor
-	}
+	result := agentapp.RuntimeConversationPage{Turns: make([]agentapp.RuntimeConversationTurn, 0, len(values)), NextCursor: nextCursor}
 	totalBytes := 0
 	// Codex returns the requested page newest-first. The application contract is
 	// chronological within each page so clients can prepend older pages.
-	for index := len(response.Data) - 1; index >= 0; index-- {
-		value := response.Data[index]
+	for index := len(values) - 1; index >= 0; index-- {
+		value := values[index]
 		if strings.TrimSpace(value.ID) == "" {
 			continue
 		}
@@ -1243,16 +1240,36 @@ func (s *Supervisor) StartTurn(ctx context.Context, request agentapp.TurnRequest
 			ID string `json:"id"`
 		} `json:"turn"`
 	}
-	input, err := turnInput(request.Text, request.ImagePaths)
-	if err != nil {
-		return agentapp.RuntimeTurn{}, err
-	}
 	s.mu.Lock()
 	workspace := s.threadWorkspaces[request.CodexThreadID]
 	safeExecutionAvailable := s.snapshot.SafeExecutionAvailable
+	if s.compactions[request.CodexThreadID] != nil || s.pendingTurns[request.CodexThreadID] != nil {
+		s.mu.Unlock()
+		return agentapp.RuntimeTurn{}, agentapp.ErrContextCompactionBusy
+	}
+	pending := &pendingTurnStart{}
+	if s.pendingTurns == nil {
+		s.pendingTurns = make(map[string]*pendingTurnStart)
+	}
+	s.pendingTurns[request.CodexThreadID] = pending
 	s.mu.Unlock()
+	defer func() {
+		s.mu.Lock()
+		if s.pendingTurns[request.CodexThreadID] == pending {
+			delete(s.pendingTurns, request.CodexThreadID)
+		}
+		s.mu.Unlock()
+	}()
 	if workspace == "" || !validSessionWorkspace(s.options.SessionWorkspaceRoot, workspace) {
 		return agentapp.RuntimeTurn{}, errors.New("Codex Turn workspace is unavailable")
+	}
+	imagePaths, err := prepareAgentInputImages(ctx, s.options.WorkingDirectory, request.ImagePaths)
+	if err != nil {
+		return agentapp.RuntimeTurn{}, err
+	}
+	input, err := turnInput(request.Text, imagePaths)
+	if err != nil {
+		return agentapp.RuntimeTurn{}, err
 	}
 	params := map[string]any{
 		"threadId": request.CodexThreadID, "model": request.ModelID, "input": input,
@@ -1273,7 +1290,9 @@ func (s *Supervisor) StartTurn(ctx context.Context, request agentapp.TurnRequest
 		return agentapp.RuntimeTurn{}, errors.New("turn/start returned no Turn ID")
 	}
 	s.mu.Lock()
-	s.activeTurns[request.CodexThreadID] = response.Turn.ID
+	if s.client == client && pending.completedTurnID != response.Turn.ID {
+		s.activeTurns[request.CodexThreadID] = response.Turn.ID
+	}
 	s.mu.Unlock()
 	return agentapp.RuntimeTurn{CodexTurnID: response.Turn.ID}, nil
 }
@@ -1292,6 +1311,16 @@ func (s *Supervisor) SteerTurnWithImages(ctx context.Context, threadID, turnID, 
 	}
 	var response struct {
 		TurnID string `json:"turnId"`
+	}
+	s.mu.Lock()
+	compacting := s.compactions[threadID] != nil
+	s.mu.Unlock()
+	if compacting {
+		return agentapp.ErrContextCompactionBusy
+	}
+	imagePaths, err = prepareAgentInputImages(ctx, s.options.WorkingDirectory, imagePaths)
+	if err != nil {
+		return err
 	}
 	input, err := turnInput(text, imagePaths)
 	if err != nil {
@@ -1376,6 +1405,9 @@ func (s *Supervisor) onNotification(notification rpcNotification) {
 		go s.refreshAccount()
 		return
 	}
+	if s.onCompactionNotification(notification) {
+		return
+	}
 	event, ok := normalizeEvent(notification)
 	if ok {
 		if event.ToolName == "shell" {
@@ -1389,7 +1421,12 @@ func (s *Supervisor) onNotification(notification rpcNotification) {
 			s.mu.Unlock()
 		} else if event.Type == agentapp.RuntimeTurnCompleted {
 			s.mu.Lock()
-			delete(s.activeTurns, event.CodexThreadID)
+			if s.activeTurns[event.CodexThreadID] == event.CodexTurnID {
+				delete(s.activeTurns, event.CodexThreadID)
+			}
+			if pending := s.pendingTurns[event.CodexThreadID]; pending != nil {
+				pending.completedTurnID = event.CodexTurnID
+			}
 			s.mu.Unlock()
 		}
 		s.emit(event)
@@ -1431,11 +1468,15 @@ func (s *Supervisor) refreshAccount() {
 
 func normalizeEvent(notification rpcNotification) (agentapp.RuntimeEvent, bool) {
 	var params struct {
-		ThreadID string `json:"threadId"`
-		TurnID   string `json:"turnId"`
-		ItemID   string `json:"itemId"`
-		Delta    string `json:"delta"`
-		Turn     struct {
+		ThreadID  string `json:"threadId"`
+		TurnID    string `json:"turnId"`
+		ItemID    string `json:"itemId"`
+		Delta     string `json:"delta"`
+		WillRetry bool   `json:"willRetry"`
+		Error     *struct {
+			Message *string `json:"message"`
+		} `json:"error"`
+		Turn struct {
 			ID     string `json:"id"`
 			Status string `json:"status"`
 			Error  *struct {
@@ -1455,6 +1496,15 @@ func normalizeEvent(notification rpcNotification) (agentapp.RuntimeEvent, bool) 
 	}
 	event := agentapp.RuntimeEvent{CodexThreadID: params.ThreadID, CodexTurnID: params.TurnID, OccurredAt: time.Now().UTC()}
 	switch notification.Method {
+	case "error":
+		// The bundled app-server's ErrorNotification requires error, threadId,
+		// turnId and willRetry. A recoverable request error is not a terminal
+		// Turn failure; Codex owns its retry and subsequent completion.
+		if !params.WillRetry || params.ThreadID == "" || params.TurnID == "" || params.Error == nil || params.Error.Message == nil {
+			return agentapp.RuntimeEvent{}, false
+		}
+		event.Type = agentapp.RuntimeTurnRetrying
+		event.FailureCode = agentapp.RuntimeRetryingFailureCode
 	case "turn/started":
 		event.Type = agentapp.RuntimeTurnStarted
 		event.CodexTurnID = params.Turn.ID
@@ -1558,6 +1608,9 @@ func (s *Supervisor) onExitGeneration(generation uint64, err error) {
 	s.models = nil
 	activeTurnCount := len(s.activeTurns)
 	s.activeTurns = make(map[string]string)
+	s.pendingTurns = make(map[string]*pendingTurnStart)
+	s.finishCompactionsLocked(errors.New("Codex app-server disconnected"))
+	s.compactedTurns = nil
 	s.threadWorkspaces = make(map[string]string)
 	s.snapshot.Health = agentapp.RuntimeDisconnected
 	s.snapshot.FailureCode = "codex_disconnected"
@@ -1613,6 +1666,9 @@ func (s *Supervisor) stop(ctx context.Context, permanent bool) error {
 		active[threadID] = turnID
 	}
 	s.activeTurns = make(map[string]string)
+	s.pendingTurns = make(map[string]*pendingTurnStart)
+	s.finishCompactionsLocked(errors.New("Codex Runtime stopped during context compaction"))
+	s.compactedTurns = nil
 	s.threadWorkspaces = make(map[string]string)
 	s.snapshot = agentapp.RuntimeSnapshot{Health: agentapp.RuntimeDisconnected, FailureCode: "codex_restarting", FailureSummary: "Codex Runtime is restarting"}
 	if permanent {

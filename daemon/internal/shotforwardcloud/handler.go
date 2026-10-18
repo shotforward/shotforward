@@ -22,6 +22,9 @@ func NewHandler(manager *Manager, logger *slog.Logger) (*Handler, error) {
 	if manager == nil || logger == nil {
 		return nil, errors.New("ShotForward cloud manager and logger are required")
 	}
+	manager.mu.Lock()
+	manager.proxyLogger = logger
+	manager.mu.Unlock()
 	return &Handler{manager: manager, logger: logger}, nil
 }
 

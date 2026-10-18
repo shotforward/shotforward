@@ -811,6 +811,11 @@
   box-shadow: 0 8px 22px rgb(23 37 52 / 7%);
 }
 
+.agent-session-menu > footer.agent-session-menu__actions {
+  flex-wrap: wrap;
+  gap: 8px;
+}
+
 .agent-session-menu > footer > .agent-new-session-button {
   background: var(--color-interactive);
   box-shadow: none;
